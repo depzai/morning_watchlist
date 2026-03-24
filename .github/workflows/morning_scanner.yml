@@ -1,0 +1,41 @@
+name: Morning Pre-Market Scanner
+
+on:
+  schedule:
+    - cron: "0 14 * * 1-5"   # 9:00 AM ET Mon–Fri (30 min before open)
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            alpaca-trade-api \
+            yfinance \
+            pandas \
+            numpy \
+            requests \
+            gspread \
+            google-auth \
+            lxml \
+            html5lib
+
+      - name: Run scanner
+        env:
+          ALPACA_API_KEY:      ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY:   ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL:     ${{ secrets.ALPACA_BASE_URL }}
+          NEWSAPI_KEY:         ${{ secrets.NEWSAPI_KEY }}
+          GSPREAD_SA_KEY_JSON: ${{ secrets.GSPREAD_SA_KEY_JSON }}
+        run: python morning_scanner.py
