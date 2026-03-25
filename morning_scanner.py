@@ -9,12 +9,12 @@ high-conviction intraday setups combining:
   4. Daily Supertrend trend direction
   5. Relative strength vs SPY
 
-Output: ranked watchlist → Google Sheets ("ranging" / morning_watchlist tab)
+Output: ranked watchlist -> Google Sheets ("ranging" / morning_watchlist tab)
 
 GitHub Actions secrets required:
     ALPACA_API_KEY       Alpaca paper/live key
     ALPACA_SECRET_KEY    Alpaca secret
-    FINNHUB_API_KEY      Finnhub API key (get at finnhub.io — free tier works)
+    FINNHUB_API_KEY      Finnhub API key (get at finnhub.io -- free tier works)
     GSPREAD_SA_KEY_JSON  Google service account JSON
 
 Setup:
@@ -47,39 +47,37 @@ except ImportError:
     raise ImportError("pip install gspread google-auth")
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # CONFIG
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
-FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY",   "")   # ← replaces NEWSAPI_KEY
+FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY",   "")
 
 # Scanner filters
-MIN_PRICE           = 5.0       # skip penny stocks
-MIN_AVG_VOLUME      = 500_000   # skip illiquid stocks
-MIN_GAP_PCT         = 2.0       # only care about gaps > 2%
-MAX_GAP_PCT         = 25.0      # skip parabolic/halted stocks
-TOP_N               = 20        # how many tickers to output
+MIN_PRICE      = 5.0
+MIN_AVG_VOLUME = 500_000
+MIN_GAP_PCT    = 2.0
+MAX_GAP_PCT    = 25.0
+TOP_N          = 20
 
-# Supertrend params (must match your screener)
-ATR_PERIOD          = 10
-MULTIPLIER          = 3.0
+# Supertrend params
+ATR_PERIOD = 10
+MULTIPLIER = 3.0
 
 # Scoring weights (must sum to 100)
-W_GAP               = 25        # gap size
-W_VOLUME            = 25        # pre-market volume vs avg
-W_SENTIMENT         = 20        # news sentiment
-W_SUPERTREND        = 20        # daily trend direction
-W_REL_STRENGTH      = 10        # strength vs SPY
+W_GAP          = 25
+W_VOLUME       = 25
+W_SENTIMENT    = 20
+W_SUPERTREND   = 20
+W_REL_STRENGTH = 10
 
 # Google Sheets
-GSHEET_NAME         = "ranging"
-WATCHLIST_TAB       = "morning_watchlist"
-ET                  = ZoneInfo("America/New_York")
+GSHEET_NAME   = "ranging"
+WATCHLIST_TAB = "morning_watchlist"
+ET            = ZoneInfo("America/New_York")
 
 WATCHLIST_HEADERS = [
     "run_timestamp", "date", "ticker", "score",
@@ -98,11 +96,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # GOOGLE SHEETS
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -157,16 +153,14 @@ def log_watchlist_to_sheet(watchlist: list, run_ts: str, today: str):
             round(w["target"], 2),
         ] for w in watchlist]
         ws.append_rows(rows, value_input_option="RAW")
-        log.info(f"  ✓ {len(rows)} tickers → '{GSHEET_NAME}' / {WATCHLIST_TAB}")
+        log.info(f"  Logged {len(rows)} tickers to '{GSHEET_NAME}' / {WATCHLIST_TAB}")
     except Exception as e:
-        log.error(f"  ✗ Failed to log watchlist: {e}")
+        log.error(f"  Failed to log watchlist: {e}")
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
-# 1. UNIVERSE — reuse S&P 500 scrape
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
+# 1. UNIVERSE
+# ===========================================================================
 
 def get_universe(max_tickers: int = 503) -> list:
     try:
@@ -175,33 +169,27 @@ def get_universe(max_tickers: int = 503) -> list:
         log.info(f"  Universe: {len(tickers)} S&P 500 tickers")
         return tickers[:max_tickers]
     except Exception as e:
-        log.warning(f"  Could not scrape S&P 500: {e} — using fallback")
+        log.warning(f"  Could not scrape S&P 500: {e} -- using fallback")
         return [
             "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","UNH","V",
             "XOM","JNJ","PG","MA","HD","CVX","MRK","ABBV","PEP","COST",
         ]
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 2. PRE-MARKET DATA via Alpaca
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def get_alpaca_client():
     return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 
 
 def get_premarket_snapshots(tickers: list) -> dict:
-    """
-    Uses Alpaca's /v2/stocks/snapshots to get latest trade + prev close
-    for all tickers in one call. Returns {ticker: snapshot_dict}.
-    """
     api = get_alpaca_client()
-    log.info(f"  Fetching Alpaca snapshots for {len(tickers)} tickers …")
+    log.info(f"  Fetching Alpaca snapshots for {len(tickers)} tickers ...")
 
-    snapshots = {}
-    chunk_size = 100  # Alpaca limit per request
+    snapshots  = {}
+    chunk_size = 100
 
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i + chunk_size]
@@ -218,10 +206,6 @@ def get_premarket_snapshots(tickers: list) -> dict:
 
 
 def parse_gap_data(snapshots: dict) -> list:
-    """
-    Extract gap % and pre-market volume from snapshots.
-    Returns list of dicts for tickers meeting gap/price/volume filters.
-    """
     gaps = []
 
     for ticker, snap in snapshots.items():
@@ -259,13 +243,10 @@ def parse_gap_data(snapshots: dict) -> list:
     return gaps
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 3. NEWS SENTIMENT via Finnhub
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
-# Simple keyword-based sentiment — no external NLP library needed
 POSITIVE_WORDS = {
     "beat", "beats", "record", "surge", "surges", "jumps", "jump", "rally",
     "rallies", "upgrade", "upgraded", "raises", "raised", "strong", "stronger",
@@ -284,10 +265,6 @@ NEGATIVE_WORDS = {
 
 
 def score_headline(text: str) -> float:
-    """
-    Returns sentiment score: +1.0 (very positive) to -1.0 (very negative).
-    Simple word-count approach — good enough for a filter signal.
-    """
     if not text:
         return 0.0
     words = set(re.sub(r"[^a-z\s]", "", text.lower()).split())
@@ -300,21 +277,11 @@ def score_headline(text: str) -> float:
 
 
 def fetch_news_sentiment(tickers: list) -> dict:
-    """
-    Fetches recent company news for each ticker via Finnhub's
-    /api/v1/company-news endpoint (free tier, no rate-limit key needed
-    beyond the token).
-
-    Finnhub returns articles with 'headline' and 'summary' fields.
-    We score the last 24 hours of articles, same logic as before.
-
-    Returns {ticker: {score, label, headline}}.
-    """
     if not FINNHUB_API_KEY:
-        log.warning("  FINNHUB_API_KEY not set — skipping sentiment")
+        log.warning("  FINNHUB_API_KEY not set -- skipping sentiment")
         return {}
 
-    log.info(f"  Fetching news sentiment for {len(tickers)} tickers via Finnhub …")
+    log.info(f"  Fetching news sentiment for {len(tickers)} tickers via Finnhub ...")
 
     today_str     = datetime.now().strftime("%Y-%m-%d")
     yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
@@ -331,13 +298,12 @@ def fetch_news_sentiment(tickers: list) -> dict:
             }
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
-            articles = r.json()  # list of article dicts
+            articles = r.json()
 
             if not articles:
                 results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
                 continue
 
-            # Score up to 5 most-recent articles
             recent = articles[:5]
             scores = [
                 score_headline(a.get("headline", "") + " " + a.get("summary", ""))
@@ -345,8 +311,7 @@ def fetch_news_sentiment(tickers: list) -> dict:
             ]
             avg_score    = round(sum(scores) / len(scores), 3)
             top_headline = recent[0].get("headline", "")
-
-            label = "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "neutral"
+            label        = "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "neutral"
 
             results[ticker] = {
                 "score"   : avg_score,
@@ -354,8 +319,7 @@ def fetch_news_sentiment(tickers: list) -> dict:
                 "headline": top_headline,
             }
 
-            # Finnhub free tier: 60 calls/min → sleep ~1 s to stay safe
-            time.sleep(1.1)
+            time.sleep(1.1)  # Finnhub free tier: 60 calls/min
 
         except Exception as e:
             log.warning(f"  News fetch failed for {ticker}: {e}")
@@ -364,14 +328,11 @@ def fetch_news_sentiment(tickers: list) -> dict:
     return results
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 4. SUPERTREND SIGNAL (daily)
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def compute_supertrend(df: pd.DataFrame) -> int:
-    """Returns 1 (uptrend) or -1 (downtrend) for the latest bar."""
     try:
         high, low, close = df["High"], df["Low"], df["Close"]
         tr = pd.concat([
@@ -399,8 +360,7 @@ def compute_supertrend(df: pd.DataFrame) -> int:
 
 
 def get_supertrend_signals(tickers: list) -> dict:
-    """Returns {ticker: 1 or -1} for daily Supertrend."""
-    log.info(f"  Computing daily Supertrend for {len(tickers)} tickers …")
+    log.info(f"  Computing daily Supertrend for {len(tickers)} tickers ...")
     end   = datetime.today()
     start = end - timedelta(days=90)
 
@@ -430,55 +390,36 @@ def get_supertrend_signals(tickers: list) -> dict:
     return signals
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 5. RELATIVE STRENGTH vs SPY
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def get_spy_change() -> float:
-    """Get SPY's pre-market % change vs prior close."""
     try:
         snap = get_alpaca_client().get_snapshot("SPY")
-        prev  = float(snap.previous_daily_bar.c)
-        curr  = float(snap.minute_bar.c) if snap.minute_bar else float(snap.latest_trade.p)
+        prev = float(snap.previous_daily_bar.c)
+        curr = float(snap.minute_bar.c) if snap.minute_bar else float(snap.latest_trade.p)
         return ((curr - prev) / prev) * 100
     except Exception:
         return 0.0
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 6. SCORING
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
                  spy_change: float) -> dict:
-    """
-    Combine all signals into a 0–100 composite score.
-    Higher = stronger setup.
-    """
     ticker = gap_data["ticker"]
 
-    # ── Gap score (0–100): 2% = 0, 10%+ = 100
-    gap_score = min(100, max(0, (gap_data["gap_pct"] - MIN_GAP_PCT) / (10 - MIN_GAP_PCT) * 100))
-
-    # ── Volume score (0–100): ratio 0.5x = 0, 3x+ = 100
-    vol_score = min(100, max(0, (gap_data["volume_ratio"] - 0.5) / 2.5 * 100))
-
-    # ── Sentiment score (0–100): -1 = 0, +1 = 100
-    sent_raw   = sentiment.get("score", 0.0)
-    sent_score = min(100, max(0, (sent_raw + 1) / 2 * 100))
-
-    # ── Supertrend score: uptrend = 100, neutral = 50, downtrend = 0
-    st_score = 100 if supertrend == 1 else 0 if supertrend == -1 else 50
-
-    # ── Relative strength: stock gap vs SPY gap
+    gap_score    = min(100, max(0, (gap_data["gap_pct"] - MIN_GAP_PCT) / (10 - MIN_GAP_PCT) * 100))
+    vol_score    = min(100, max(0, (gap_data["volume_ratio"] - 0.5) / 2.5 * 100))
+    sent_raw     = sentiment.get("score", 0.0)
+    sent_score   = min(100, max(0, (sent_raw + 1) / 2 * 100))
+    st_score     = 100 if supertrend == 1 else 0 if supertrend == -1 else 50
     rel_strength = gap_data["gap_pct"] - spy_change
     rs_score     = min(100, max(0, (rel_strength + 5) / 10 * 100))
 
-    # ── Composite score
     composite = round(
         (gap_score   * W_GAP          / 100) +
         (vol_score   * W_VOLUME       / 100) +
@@ -488,7 +429,6 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
         1
     )
 
-    # ── Risk levels: stop = 2% below premarket, target = 4% above (2R)
     entry     = gap_data["premarket_price"]
     stop_loss = round(entry * 0.98, 2)
     target    = round(entry * 1.04, 2)
@@ -511,11 +451,9 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
     }
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # 7. MAIN
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 def run_morning_scanner():
     run_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
@@ -526,11 +464,9 @@ def run_morning_scanner():
     log.info(f"  Run: {run_ts}")
     log.info("=" * 60)
 
-    # ── Universe ──────────────────────────────────────────────────
     tickers = get_universe()
 
-    # ── Pre-market gaps ───────────────────────────────────────────
-    log.info("\n[1/5] Fetching pre-market snapshots …")
+    log.info("\n[1/5] Fetching pre-market snapshots ...")
     snapshots = get_premarket_snapshots(tickers)
     gap_list  = parse_gap_data(snapshots)
 
@@ -540,21 +476,17 @@ def run_morning_scanner():
 
     gap_tickers = [g["ticker"] for g in gap_list]
 
-    # ── SPY baseline ──────────────────────────────────────────────
-    log.info("\n[2/5] Getting SPY baseline …")
+    log.info("\n[2/5] Getting SPY baseline ...")
     spy_change = get_spy_change()
     log.info(f"  SPY pre-market change: {spy_change:+.2f}%")
 
-    # ── News sentiment ────────────────────────────────────────────
-    log.info("\n[3/5] Fetching news sentiment …")
+    log.info("\n[3/5] Fetching news sentiment ...")
     sentiment_map = fetch_news_sentiment(gap_tickers)
 
-    # ── Supertrend ────────────────────────────────────────────────
-    log.info("\n[4/5] Computing Supertrend signals …")
+    log.info("\n[4/5] Computing Supertrend signals ...")
     supertrend_map = get_supertrend_signals(gap_tickers)
 
-    # ── Score and rank ────────────────────────────────────────────
-    log.info("\n[5/5] Scoring and ranking …")
+    log.info("\n[5/5] Scoring and ranking ...")
     watchlist = []
     for gap_data in gap_list:
         ticker    = gap_data["ticker"]
@@ -566,13 +498,12 @@ def run_morning_scanner():
     watchlist.sort(key=lambda x: x["score"], reverse=True)
     watchlist = watchlist[:TOP_N]
 
-    # ── Print watchlist ───────────────────────────────────────────
-    print(f"\n{'─'*80}")
-    print(f"  TOP {len(watchlist)} SETUPS — {today}")
-    print(f"{'─'*80}")
+    print(f"\n{'=' * 80}")
+    print(f"  TOP {len(watchlist)} SETUPS -- {today}")
+    print(f"{'=' * 80}")
     print(f"  {'#':<3} {'TICKER':<7} {'SCORE':<7} {'GAP%':<7} {'VOL_RATIO':<11} "
           f"{'SENTIMENT':<11} {'TREND':<10} {'ENTRY':<8} {'STOP':<8} {'TARGET'}")
-    print(f"  {'─'*75}")
+    print(f"  {'-' * 75}")
     for i, w in enumerate(watchlist, 1):
         print(f"  {i:<3} {w['ticker']:<7} {w['score']:<7} "
               f"{w['gap_pct']:>+5.1f}%  "
@@ -584,11 +515,9 @@ def run_morning_scanner():
               f"${w['target']:.2f}")
     print()
 
-    # ── Log to Google Sheets ──────────────────────────────────────
-    log.info("Logging to Google Sheets …")
+    log.info("Logging to Google Sheets ...")
     log_watchlist_to_sheet(watchlist, run_ts, today)
 
-    # ── Summary ───────────────────────────────────────────────────
     log.info("=" * 60)
     log.info(f"  Gapping tickers scanned : {len(gap_list)}")
     log.info(f"  Top setups logged       : {len(watchlist)}")
@@ -598,11 +527,10 @@ def run_morning_scanner():
     return watchlist
 
 
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 # ENTRY POINT
-# 
-─────────────────────────────────────────────────────────────────────────────
+# ===========================================================================
 
 if __name__ == "__main__":
     run_morning_scanner()
+
