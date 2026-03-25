@@ -199,8 +199,8 @@ def _get_sp500() -> list:
         "AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL",
         "AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK",
         "AZO","AVB","AVY","AXON","BKR","BALL","BAC","BK","BBWI","BAX",
-        "BDX","BRK-B","BBY","BIO","TECH","BIIB","BLK","BX","BA","BCR",
-        "BMY","AVGO","BR","BRO","BF-B","BLDR","BG","CDNS","CZR","CPT",
+        "BDX","BRK.B","BBY","BIO","TECH","BIIB","BLK","BX","BA","BCR",
+        "BMY","AVGO","BR","BRO","BF.B","BLDR","BG","CDNS","CZR","CPT",
         "CPB","COF","CAH","KMX","CCL","CARR","CTLT","CAT","CBOE","CBRE",
         "CDW","CE","COR","CNC","CNX","CDAY","CF","CRL","SCHW","CHTR",
         "CVX","CMG","CB","CHD","CI","CINF","CTAS","CSCO","C","CFG",
@@ -257,10 +257,18 @@ def _get_nasdaq100() -> list:
         r.raise_for_status()
         tables = pd.read_html(r.text)
         for table in tables:
-            if "Ticker" in table.columns:
-                tickers = table["Ticker"].str.replace(".", "-", regex=False).tolist()
-                log.info(f"  Nasdaq-100: {len(tickers)} tickers from Wikipedia")
-                return tickers
+            # Wikipedia uses "Ticker" or "Symbol" depending on page version
+            for col in ("Ticker", "Symbol", "Ticker symbol"):
+                if col in table.columns:
+                    tickers = (table[col]
+                                .astype(str)
+                                .str.strip()
+                                .str.replace(r"\[.*?\]", "", regex=True)
+                                .tolist())
+                    tickers = [t for t in tickers if t and t.lower() != "nan"]
+                    if len(tickers) > 50:   # sanity check -- real index has 100+
+                        log.info(f"  Nasdaq-100: {len(tickers)} tickers from Wikipedia")
+                        return tickers
     except Exception as e:
         log.warning(f"  Wikipedia Nasdaq-100 failed: {e}")
 
@@ -347,10 +355,21 @@ def _get_current_volume(snap) -> int:
 
 
 def _get_prev_close(snap) -> float:
+    # Try previous_daily_bar first (most accurate)
     try:
-        return float(snap.previous_daily_bar.c)
+        v = float(snap.previous_daily_bar.c)
+        if v > 0:
+            return v
     except Exception:
-        return 0.0
+        pass
+    # Fall back to daily_bar open (today's open ~ yesterday's close)
+    try:
+        v = float(snap.daily_bar.o)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return 0.0
 
 
 def get_premarket_snapshots(tickers: list) -> dict:
@@ -361,7 +380,8 @@ def get_premarket_snapshots(tickers: list) -> dict:
     chunk_size = 100
 
     for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i + chunk_size]
+        # Alpaca uses dots not dashes (e.g. BRK.B not BRK-B)
+        chunk = [t.replace("-", ".") for t in tickers[i:i + chunk_size]]
         try:
             snaps = api.get_snapshots(chunk)
             for ticker, snap in snaps.items():
@@ -672,9 +692,8 @@ def run_morning_scanner():
 
     if not gap_list:
         log.warning("No tickers found with gap > %.1f%%. Check Alpaca credentials and data feed.", MIN_GAP_PCT)
-        log.warning("""Try running: python -c \"import alpaca_trade_api as t; api=t.REST('%s','%s','%s'); 
-s=api.get_snapshot('AAPL'); 
-print(s.latest_trade.p, s.previous_daily_bar.c)\"""",
+        log.warning("Try running: python -c \"import alpaca_trade_api as t; api=t.REST('%s','%s','%s'); s=api.get_snapshot('AAPL'); print(s.latest_trade.p, 
+s.previous_daily_bar.c)\"",
                     ALPACA_API_KEY[:4] + "...", "***", ALPACA_BASE_URL)
         return
 
@@ -738,3 +757,4 @@ print(s.latest_trade.p, s.previous_daily_bar.c)\"""",
 
 if __name__ == "__main__":
     run_morning_scanner()
+
