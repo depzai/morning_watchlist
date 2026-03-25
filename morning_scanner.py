@@ -28,7 +28,6 @@ import logging
 import re
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -159,21 +158,109 @@ def log_watchlist_to_sheet(watchlist: list, run_ts: str, today: str):
 
 
 # ===========================================================================
-# 1. UNIVERSE
+# 1. UNIVERSE -- S&P 500 + Nasdaq 100
 # ===========================================================================
 
-def get_universe(max_tickers: int = 503) -> list:
+def _get_sp500() -> list:
+    """
+    Fetch S&P 500 tickers. Tries multiple sources before falling back
+    to a hardcoded list of the largest S&P 500 components.
+    """
+    # Source 1: slickcharts (most reliable, has user-agent bypass)
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"}
+        r = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        tables = pd.read_html(r.text)
         tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        log.info(f"  Universe: {len(tickers)} S&P 500 tickers")
-        return tickers[:max_tickers]
+        log.info(f"  S&P 500: {len(tickers)} tickers from Wikipedia")
+        return tickers
     except Exception as e:
-        log.warning(f"  Could not scrape S&P 500: {e} -- using fallback")
-        return [
-            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","JPM","UNH","V",
-            "XOM","JNJ","PG","MA","HD","CVX","MRK","ABBV","PEP","COST",
-        ]
+        log.warning(f"  Wikipedia S&P 500 failed: {e}")
+
+    # Source 2: datahub.io CSV
+    try:
+        r = requests.get(
+            "https://pkgstore.datahub.io/core/s-and-p-500-companies/constituents_csv/data/constituents_csv.csv",
+            timeout=15,
+        )
+        r.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        log.info(f"  S&P 500: {len(tickers)} tickers from datahub.io")
+        return tickers
+    except Exception as e:
+        log.warning(f"  datahub.io S&P 500 failed: {e}")
+
+    # Fallback: top 100 S&P 500 components by weight
+    log.warning("  Using hardcoded S&P 500 fallback (top 100)")
+    return [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","BRK-B","JPM",
+        "LLY","V","UNH","XOM","MA","JNJ","PG","AVGO","HD","MRK",
+        "COST","ABBV","CVX","WMT","BAC","NFLX","KO","PEP","ADBE","CRM",
+        "TMO","ACN","MCD","CSCO","ABT","LIN","DHR","TXN","NEE","PM",
+        "NKE","MS","WFC","INTC","IBM","RTX","INTU","AMGN","GS","CAT",
+        "SPGI","BLK","ISRG","ELV","SYK","MDT","AXP","T","GILD","ADI",
+        "VRTX","PLD","REGN","C","MMC","CB","MDLZ","MO","ZTS","SO",
+        "ETN","BSX","ADP","TJX","CI","DE","LRCX","EOG","PGR","BDX",
+        "CME","SLB","AON","ITW","NOC","APD","FI","HUM","MCO","EW",
+        "MPC","PSA","WM","DUK","NSC","KLAC","FCX","EMR","USB","GE",
+    ]
+
+
+def _get_nasdaq100() -> list:
+    """
+    Fetch Nasdaq-100 tickers. Tries multiple sources.
+    """
+    # Source 1: Wikipedia
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"}
+        r = requests.get(
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        tables = pd.read_html(r.text)
+        # The components table has a "Ticker" column
+        for table in tables:
+            if "Ticker" in table.columns:
+                tickers = table["Ticker"].str.replace(".", "-", regex=False).tolist()
+                log.info(f"  Nasdaq-100: {len(tickers)} tickers from Wikipedia")
+                return tickers
+    except Exception as e:
+        log.warning(f"  Wikipedia Nasdaq-100 failed: {e}")
+
+    # Fallback: hardcoded Nasdaq-100
+    log.warning("  Using hardcoded Nasdaq-100 fallback")
+    return [
+        "MSFT","AAPL","NVDA","AMZN","META","TSLA","GOOGL","GOOG","AVGO","COST",
+        "NFLX","TMUS","ASML","CSCO","ADBE","AMD","PEP","INTU","AMAT","TXN",
+        "QCOM","ISRG","AMGN","BKNG","CMCSA","ARM","MU","PANW","ADI","LRCX",
+        "SBUX","INTC","KLAC","MELI","MDLZ","REGN","GILD","SNPS","CDNS","CEG",
+        "CRWD","CTAS","ABNB","MAR","ORLY","MRVL","MNST","PYPL","PCAR","FTNT",
+        "ADSK","DASH","WDAY","KDP","AZN","CHTR","ROP","NXPI","MCHP","PAYX",
+        "TEAM","AEP","ROST","DXCM","IDXX","CPRT","ODFL","EA","VRSK","FAST",
+        "FANG","XEL","CTSH","BIIB","ON","BKR","KHC","CSGP","DDOG","GEHC",
+        "EXC","TTD","CCEP","LULU","ANSS","ILMN","WBA","MDB","ZS","SIRI",
+        "MTCH","LCID","RIVN","DLTR","ZM","PDD","MRNA","GFS","ALGN","CDW",
+    ]
+
+
+def get_universe() -> list:
+    """
+    Returns deduplicated list of S&P 500 + Nasdaq-100 tickers.
+    """
+    sp500   = _get_sp500()
+    nasdaq  = _get_nasdaq100()
+    combined = list(dict.fromkeys(sp500 + nasdaq))  # deduplicate, preserve order
+    log.info(f"  Combined universe: {len(combined)} unique tickers (S&P 500 + Nasdaq-100)")
+    return combined
 
 
 # ===========================================================================
@@ -533,4 +620,3 @@ def run_morning_scanner():
 
 if __name__ == "__main__":
     run_morning_scanner()
-
