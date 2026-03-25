@@ -117,12 +117,25 @@ def _gsheet_client():
 
 
 def _ensure_tab(spreadsheet, tab_name, headers):
+    """
+    Get or create the worksheet. Always checks that row 1 contains
+    the correct headers -- writes them if missing or wrong.
+    """
     try:
         ws = spreadsheet.worksheet(tab_name)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=tab_name, rows=10000, cols=len(headers))
-        ws.append_row(headers, value_input_option="RAW")
         log.info(f"  Created tab: {tab_name}")
+
+    # Check if header row is present and correct
+    existing = ws.row_values(1)
+    if existing != headers:
+        if existing:
+            # Header row exists but is wrong/missing some columns -- overwrite row 1
+            ws.delete_rows(1)
+        ws.insert_row(headers, index=1, value_input_option="RAW")
+        log.info(f"  Wrote headers to tab: {tab_name}")
+
     return ws
 
 
@@ -257,7 +270,6 @@ def _get_nasdaq100() -> list:
         r.raise_for_status()
         tables = pd.read_html(r.text)
         for table in tables:
-            # Wikipedia uses "Ticker" or "Symbol" depending on page version
             for col in ("Ticker", "Symbol", "Ticker symbol"):
                 if col in table.columns:
                     tickers = (table[col]
@@ -266,7 +278,7 @@ def _get_nasdaq100() -> list:
                                 .str.replace(r"\[.*?\]", "", regex=True)
                                 .tolist())
                     tickers = [t for t in tickers if t and t.lower() != "nan"]
-                    if len(tickers) > 50:   # sanity check -- real index has 100+
+                    if len(tickers) > 50:
                         log.info(f"  Nasdaq-100: {len(tickers)} tickers from Wikipedia")
                         return tickers
     except Exception as e:
@@ -288,8 +300,8 @@ def _get_nasdaq100() -> list:
 
 
 def get_universe() -> list:
-    sp500   = _get_sp500()
-    nasdaq  = _get_nasdaq100()
+    sp500    = _get_sp500()
+    nasdaq   = _get_nasdaq100()
     combined = list(dict.fromkeys(sp500 + nasdaq))
     log.info(f"  Combined universe: {len(combined)} unique tickers (S&P 500 + Nasdaq-100)")
     return combined
@@ -304,50 +316,34 @@ def get_alpaca_client():
 
 
 def _get_current_price(snap) -> float:
-    """
-    Extract the best available current price from a snapshot.
-    Priority: latest_trade -> minute_bar -> daily_bar open
-    This works both pre-market and during market hours.
-    """
-    # Latest trade is the most reliable source at any time of day
     try:
         p = float(snap.latest_trade.p)
         if p > 0:
             return p
     except Exception:
         pass
-
-    # Fall back to latest minute bar close
     try:
         p = float(snap.minute_bar.c)
         if p > 0:
             return p
     except Exception:
         pass
-
-    # Last resort: today's daily bar open
     try:
         p = float(snap.daily_bar.o)
         if p > 0:
             return p
     except Exception:
         pass
-
     return 0.0
 
 
 def _get_current_volume(snap) -> int:
-    """
-    Get best available volume. During market hours daily_bar.v is the
-    accumulated intraday volume, which is more meaningful than minute_bar.v.
-    """
     try:
         v = int(snap.daily_bar.v)
         if v > 0:
             return v
     except Exception:
         pass
-
     try:
         return int(snap.minute_bar.v)
     except Exception:
@@ -355,14 +351,12 @@ def _get_current_volume(snap) -> int:
 
 
 def _get_prev_close(snap) -> float:
-    # Try previous_daily_bar first (most accurate)
     try:
         v = float(snap.previous_daily_bar.c)
         if v > 0:
             return v
     except Exception:
         pass
-    # Fall back to daily_bar open (today's open ~ yesterday's close)
     try:
         v = float(snap.daily_bar.o)
         if v > 0:
@@ -380,7 +374,6 @@ def get_premarket_snapshots(tickers: list) -> dict:
     chunk_size = 100
 
     for i in range(0, len(tickers), chunk_size):
-        # Alpaca uses dots not dashes (e.g. BRK.B not BRK-B)
         chunk = [t.replace("-", ".") for t in tickers[i:i + chunk_size]]
         try:
             snaps = api.get_snapshots(chunk)
@@ -392,7 +385,6 @@ def get_premarket_snapshots(tickers: list) -> dict:
 
     log.info(f"  Got snapshots for {len(snapshots)} tickers")
 
-    # Debug: show a sample snapshot to verify data quality
     if snapshots:
         sample_ticker = next(iter(snapshots))
         sample_snap   = snapshots[sample_ticker]
@@ -416,8 +408,6 @@ def parse_gap_data(snapshots: dict) -> list:
             current_price = _get_current_price(snap)
             current_vol   = _get_current_volume(snap)
 
-            # Get 20-day avg volume from daily bar if available
-            # We use previous_daily_bar volume as a rough proxy
             try:
                 prev_vol = float(snap.previous_daily_bar.v)
             except Exception:
@@ -437,7 +427,6 @@ def parse_gap_data(snapshots: dict) -> list:
                 skipped_gap += 1
                 continue
 
-            # Volume ratio: today's vol vs yesterday's vol as a proxy
             vol_ratio = current_vol / prev_vol if prev_vol > 0 else 0.0
 
             gaps.append({
@@ -465,29 +454,52 @@ def parse_gap_data(snapshots: dict) -> list:
 # 3. NEWS SENTIMENT via Finnhub
 # ===========================================================================
 
+# Expanded word lists for better headline coverage
 POSITIVE_WORDS = {
-    "beat", "beats", "record", "surge", "surges", "jumps", "jump", "rally",
-    "rallies", "upgrade", "upgraded", "raises", "raised", "strong", "stronger",
-    "growth", "profit", "profits", "win", "wins", "deal", "acquisition",
-    "partnership", "approval", "approved", "launch", "launches", "positive",
-    "outperform", "buy", "bullish", "gains", "gain", "soars", "soar",
+    # earnings / guidance
+    "beat", "beats", "topped", "exceeded", "exceeds", "surpassed", "record",
+    "raised", "raises", "boosted", "boosts", "lifted", "lifts", "increased",
+    "increases", "above", "upbeat",
+    # price action / analyst
+    "upgrade", "upgraded", "outperform", "overweight", "buy", "bullish",
+    "breakout", "rallies", "rally", "surge", "surges", "soars", "soar",
+    "jumps", "jump", "spikes", "spike", "climbs", "climb", "rises", "rise",
+    # business
+    "profit", "profits", "growth", "gains", "gain", "win", "wins",
+    "deal", "merger", "acquisition", "partnership", "approval", "approved",
+    "launch", "launches", "expands", "expansion", "positive", "strong",
+    "stronger", "strength", "robust", "solid", "better",
 }
 
 NEGATIVE_WORDS = {
-    "miss", "misses", "missed", "falls", "fall", "drops", "drop", "cut",
-    "cuts", "downgrade", "downgraded", "loss", "losses", "weak", "weaker",
-    "decline", "declines", "warning", "warn", "lawsuit", "investigation",
-    "recall", "halt", "halted", "sell", "bearish", "negative", "concern",
-    "concerns", "disappoints", "disappointing", "slump", "slumps",
+    # earnings / guidance
+    "missed", "misses", "miss", "below", "disappointed", "disappoints",
+    "disappointing", "cut", "cuts", "lowered", "lowers", "reduced", "reduces",
+    "slashed", "slashes", "warned", "warns", "warning",
+    # price action / analyst
+    "downgrade", "downgraded", "underperform", "underweight", "sell", "bearish",
+    "falls", "fall", "drops", "drop", "slides", "slide", "slumps", "slump",
+    "plunges", "plunge", "tumbles", "tumble", "declines", "decline", "sinks",
+    "sink", "dips", "dip",
+    # business / legal
+    "loss", "losses", "weak", "weaker", "weakness", "concern", "concerns",
+    "risk", "risks", "lawsuit", "sued", "investigation", "probe", "recall",
+    "halt", "halted", "suspended", "layoffs", "restructuring", "bankruptcy",
+    "default", "negative", "pressure",
 }
 
 
 def score_headline(text: str) -> float:
+    """
+    Returns sentiment score: +1.0 (very positive) to -1.0 (very negative).
+    Uses substring matching so partial word forms are caught.
+    """
     if not text:
         return 0.0
-    words = set(re.sub(r"[^a-z\s]", "", text.lower()).split())
-    pos   = len(words & POSITIVE_WORDS)
-    neg   = len(words & NEGATIVE_WORDS)
+    text_lower = text.lower()
+    # Use substring matching rather than exact word set intersection
+    pos = sum(1 for w in POSITIVE_WORDS if w in text_lower)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in text_lower)
     total = pos + neg
     if total == 0:
         return 0.0
@@ -504,6 +516,7 @@ def fetch_news_sentiment(tickers: list) -> dict:
     today_str     = datetime.now().strftime("%Y-%m-%d")
     yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
     results       = {}
+    neutral_count = 0
 
     for ticker in tickers:
         try:
@@ -520,8 +533,10 @@ def fetch_news_sentiment(tickers: list) -> dict:
 
             if not articles:
                 results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
+                neutral_count += 1
                 continue
 
+            # Score up to 5 most recent articles, combine headline + summary
             recent = articles[:5]
             scores = [
                 score_headline(a.get("headline", "") + " " + a.get("summary", ""))
@@ -529,20 +544,28 @@ def fetch_news_sentiment(tickers: list) -> dict:
             ]
             avg_score    = round(sum(scores) / len(scores), 3)
             top_headline = recent[0].get("headline", "")
-            label        = "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "neutral"
+
+            # Slightly tighter thresholds so more gets labelled
+            label = "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral"
 
             results[ticker] = {
                 "score"   : avg_score,
                 "label"   : label,
                 "headline": top_headline,
             }
+            if label == "neutral":
+                neutral_count += 1
 
             time.sleep(1.1)  # Finnhub free tier: 60 calls/min
 
         except Exception as e:
             log.warning(f"  News fetch failed for {ticker}: {e}")
             results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
+            neutral_count += 1
 
+    log.info(f"  Sentiment done: {len(results)} tickers, {neutral_count} neutral, "
+             f"{sum(1 for v in results.values() if v['label'] == 'positive')} positive, "
+             f"{sum(1 for v in results.values() if v['label'] == 'negative')} negative")
     return results
 
 
