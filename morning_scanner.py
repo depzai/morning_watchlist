@@ -672,8 +672,9 @@ def run_morning_scanner():
 
     if not gap_list:
         log.warning("No tickers found with gap > %.1f%%. Check Alpaca credentials and data feed.", MIN_GAP_PCT)
-        log.warning("Try running: python -c \"import alpaca_trade_api as t; api=t.REST('%s','%s','%s'); s=api.get_snapshot('AAPL'); 
-print(s.latest_trade.p, s.previous_daily_bar.c)\"",
+        log.warning("""Try running: python -c \"import alpaca_trade_api as t; api=t.REST('%s','%s','%s'); 
+s=api.get_snapshot('AAPL'); 
+print(s.latest_trade.p, s.previous_daily_bar.c)\"""",
                     ALPACA_API_KEY[:4] + "...", "***", ALPACA_BASE_URL)
         return
 
