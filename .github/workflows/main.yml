@@ -2,7 +2,7 @@ name: Morning Pre-Market Scanner
 
 on:
   schedule:
-    - cron: "0 14 * * 1-5"   # 9:00 AM ET Mon–Fri (30 min before open)
+    - cron: "0 13 * * 1-5"   # 9:00 AM ET Mon–Fri (30 min before open)
   workflow_dispatch:
 
 jobs:
