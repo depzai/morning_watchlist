@@ -5,7 +5,7 @@ Runs at 9:00 AM ET (before open) and produces a ranked watchlist of
 high-conviction intraday setups combining:
   1. Gap % from prior close
   2. Pre-market volume vs 20-day average
-  3. News sentiment (NewsAPI)
+  3. News sentiment (Finnhub)
   4. Daily Supertrend trend direction
   5. Relative strength vs SPY
 
@@ -14,7 +14,7 @@ Output: ranked watchlist → Google Sheets ("ranging" / morning_watchlist tab)
 GitHub Actions secrets required:
     ALPACA_API_KEY       Alpaca paper/live key
     ALPACA_SECRET_KEY    Alpaca secret
-    NEWSAPI_KEY          NewsAPI.org free key (get at newsapi.org)
+    FINNHUB_API_KEY      Finnhub API key (get at finnhub.io — free tier works)
     GSPREAD_SA_KEY_JSON  Google service account JSON
 
 Setup:
@@ -47,14 +47,16 @@ except ImportError:
     raise ImportError("pip install gspread google-auth")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
-NEWSAPI_KEY       = os.getenv("NEWSAPI_KEY",       "")
+FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY",   "")   # ← replaces NEWSAPI_KEY
 
 # Scanner filters
 MIN_PRICE           = 5.0       # skip penny stocks
@@ -96,9 +98,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -158,9 +162,11 @@ def log_watchlist_to_sheet(watchlist: list, run_ts: str, today: str):
         log.error(f"  ✗ Failed to log watchlist: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 1. UNIVERSE — reuse S&P 500 scrape
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def get_universe(max_tickers: int = 503) -> list:
     try:
@@ -176,9 +182,11 @@ def get_universe(max_tickers: int = 503) -> list:
         ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 2. PRE-MARKET DATA via Alpaca
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def get_alpaca_client():
     return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
@@ -218,10 +226,10 @@ def parse_gap_data(snapshots: dict) -> list:
 
     for ticker, snap in snapshots.items():
         try:
-            prev_close     = float(snap.previous_daily_bar.c)
+            prev_close      = float(snap.previous_daily_bar.c)
             premarket_price = float(snap.minute_bar.c) if snap.minute_bar else float(snap.latest_trade.p)
-            premarket_vol  = int(snap.minute_bar.v) if snap.minute_bar else 0
-            daily_vol_avg  = float(snap.daily_bar.v) if snap.daily_bar else 0
+            premarket_vol   = int(snap.minute_bar.v) if snap.minute_bar else 0
+            daily_vol_avg   = float(snap.daily_bar.v) if snap.daily_bar else 0
 
             if prev_close <= 0 or premarket_price <= 0:
                 continue
@@ -251,9 +259,11 @@ def parse_gap_data(snapshots: dict) -> list:
     return gaps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. NEWS SENTIMENT via NewsAPI
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
+# 3. NEWS SENTIMENT via Finnhub
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 # Simple keyword-based sentiment — no external NLP library needed
 POSITIVE_WORDS = {
@@ -280,10 +290,10 @@ def score_headline(text: str) -> float:
     """
     if not text:
         return 0.0
-    words  = set(re.sub(r"[^a-z\s]", "", text.lower()).split())
-    pos    = len(words & POSITIVE_WORDS)
-    neg    = len(words & NEGATIVE_WORDS)
-    total  = pos + neg
+    words = set(re.sub(r"[^a-z\s]", "", text.lower()).split())
+    pos   = len(words & POSITIVE_WORDS)
+    neg   = len(words & NEGATIVE_WORDS)
+    total = pos + neg
     if total == 0:
         return 0.0
     return round((pos - neg) / total, 3)
@@ -291,40 +301,50 @@ def score_headline(text: str) -> float:
 
 def fetch_news_sentiment(tickers: list) -> dict:
     """
-    Fetches recent news for each ticker via NewsAPI.
+    Fetches recent company news for each ticker via Finnhub's
+    /api/v1/company-news endpoint (free tier, no rate-limit key needed
+    beyond the token).
+
+    Finnhub returns articles with 'headline' and 'summary' fields.
+    We score the last 24 hours of articles, same logic as before.
+
     Returns {ticker: {score, label, headline}}.
     """
-    if not NEWSAPI_KEY:
-        log.warning("  NEWSAPI_KEY not set — skipping sentiment")
+    if not FINNHUB_API_KEY:
+        log.warning("  FINNHUB_API_KEY not set — skipping sentiment")
         return {}
 
-    log.info(f"  Fetching news sentiment for {len(tickers)} tickers …")
-    results = {}
+    log.info(f"  Fetching news sentiment for {len(tickers)} tickers via Finnhub …")
+
+    today_str     = datetime.now().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
+    results       = {}
 
     for ticker in tickers:
         try:
-            url    = "https://newsapi.org/v2/everything"
+            url    = "https://finnhub.io/api/v1/company-news"
             params = {
-                "q"          : ticker,
-                "language"   : "en",
-                "sortBy"     : "publishedAt",
-                "pageSize"   : 5,
-                "from"       : (datetime.now() - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%S"),
-                "apiKey"     : NEWSAPI_KEY,
+                "symbol": ticker,
+                "from"  : yesterday_str,
+                "to"    : today_str,
+                "token" : FINNHUB_API_KEY,
             }
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
-            articles = r.json().get("articles", [])
+            articles = r.json()  # list of article dicts
 
             if not articles:
                 results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
                 continue
 
-            # Score all headlines and take the average
-            scores = [score_headline(a.get("title", "") + " " + a.get("description", ""))
-                      for a in articles]
-            avg_score  = round(sum(scores) / len(scores), 3)
-            top_headline = articles[0].get("title", "")
+            # Score up to 5 most-recent articles
+            recent = articles[:5]
+            scores = [
+                score_headline(a.get("headline", "") + " " + a.get("summary", ""))
+                for a in recent
+            ]
+            avg_score    = round(sum(scores) / len(scores), 3)
+            top_headline = recent[0].get("headline", "")
 
             label = "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "neutral"
 
@@ -333,7 +353,9 @@ def fetch_news_sentiment(tickers: list) -> dict:
                 "label"   : label,
                 "headline": top_headline,
             }
-            time.sleep(0.1)  # stay under free tier rate limit
+
+            # Finnhub free tier: 60 calls/min → sleep ~1 s to stay safe
+            time.sleep(1.1)
 
         except Exception as e:
             log.warning(f"  News fetch failed for {ticker}: {e}")
@@ -342,9 +364,11 @@ def fetch_news_sentiment(tickers: list) -> dict:
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 4. SUPERTREND SIGNAL (daily)
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def compute_supertrend(df: pd.DataFrame) -> int:
     """Returns 1 (uptrend) or -1 (downtrend) for the latest bar."""
@@ -406,9 +430,11 @@ def get_supertrend_signals(tickers: list) -> dict:
     return signals
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 5. RELATIVE STRENGTH vs SPY
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def get_spy_change() -> float:
     """Get SPY's pre-market % change vs prior close."""
@@ -421,9 +447,11 @@ def get_spy_change() -> float:
         return 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 6. SCORING
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
                  spy_change: float) -> dict:
@@ -466,26 +494,28 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
     target    = round(entry * 1.04, 2)
 
     return {
-        "ticker"           : ticker,
-        "score"            : composite,
-        "gap_pct"          : gap_data["gap_pct"],
-        "premarket_volume" : gap_data["premarket_volume"],
-        "volume_ratio"     : gap_data["volume_ratio"],
-        "sentiment_score"  : sentiment.get("score", 0.0),
-        "sentiment_label"  : sentiment.get("label", "neutral"),
-        "news_headline"    : sentiment.get("headline", ""),
-        "supertrend_signal": "bullish" if supertrend == 1 else "bearish" if supertrend == -1 else "neutral",
+        "ticker"             : ticker,
+        "score"              : composite,
+        "gap_pct"            : gap_data["gap_pct"],
+        "premarket_volume"   : gap_data["premarket_volume"],
+        "volume_ratio"       : gap_data["volume_ratio"],
+        "sentiment_score"    : sentiment.get("score", 0.0),
+        "sentiment_label"    : sentiment.get("label", "neutral"),
+        "news_headline"      : sentiment.get("headline", ""),
+        "supertrend_signal"  : "bullish" if supertrend == 1 else "bearish" if supertrend == -1 else "neutral",
         "rel_strength_vs_spy": rel_strength,
-        "prior_close"      : gap_data["prior_close"],
-        "premarket_price"  : entry,
-        "stop_loss"        : stop_loss,
-        "target"           : target,
+        "prior_close"        : gap_data["prior_close"],
+        "premarket_price"    : entry,
+        "stop_loss"          : stop_loss,
+        "target"             : target,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # 7. MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 def run_morning_scanner():
     run_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
@@ -568,9 +598,11 @@ def run_morning_scanner():
     return watchlist
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_morning_scanner()
