@@ -1,24 +1,26 @@
 """
 Morning Pre-Market Scanner
 ==========================
-Runs at 9:00 AM ET (before open) and produces a ranked watchlist of
-high-conviction intraday setups combining:
-  1. Gap % from prior close
-  2. Pre-market volume vs 20-day average
+Runs at 9:00 AM ET and produces a ranked watchlist of high-conviction
+intraday setups combining:
+  1. Gap % from prior close  (yfinance -- wider universe, no Alpaca gaps)
+  2. Volume ratio vs 20-day average  (yfinance)
   3. News sentiment (Finnhub)
-  4. Daily Supertrend trend direction
+  4. Daily Supertrend trend direction (yfinance)
   5. Relative strength vs SPY
 
-Output: ranked watchlist -> Google Sheets ("ranging" / morning_watchlist tab)
+Universe: S&P 500 + Nasdaq 100 + a broad mid-cap extension (~1,500 tickers)
+Output  : ranked watchlist -> Google Sheets ("ranging" / morning_watchlist tab)
 
 GitHub Actions secrets required:
-    ALPACA_API_KEY       Alpaca paper/live key
-    ALPACA_SECRET_KEY    Alpaca secret
-    FINNHUB_API_KEY      Finnhub API key (get at finnhub.io -- free tier works)
+    FINNHUB_API_KEY      finnhub.io free key
     GSPREAD_SA_KEY_JSON  Google service account JSON
 
+Optional (not required any more for gap detection):
+    ALPACA_API_KEY / ALPACA_SECRET_KEY  (kept for SPY baseline only)
+
 Setup:
-    pip install alpaca-trade-api yfinance pandas numpy requests gspread google-auth
+    pip install yfinance pandas numpy requests gspread google-auth
 """
 
 import os
@@ -28,16 +30,12 @@ import logging
 import re
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+from io import StringIO
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-
-try:
-    import alpaca_trade_api as tradeapi
-except ImportError:
-    raise ImportError("pip install alpaca-trade-api")
 
 try:
     import gspread
@@ -50,16 +48,13 @@ except ImportError:
 # CONFIG
 # ===========================================================================
 
-ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY",    "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL",   "https://paper-api.alpaca.markets")
-FINNHUB_API_KEY   = os.getenv("FINNHUB_API_KEY",   "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 # Scanner filters
 MIN_PRICE      = 5.0
-MIN_AVG_VOLUME = 500_000
 MIN_GAP_PCT    = 2.0
 MAX_GAP_PCT    = 30.0
+MIN_AVG_VOL    = 200_000   # 20-day avg volume floor
 TOP_N          = 20
 
 # Supertrend params
@@ -117,21 +112,15 @@ def _gsheet_client():
 
 
 def _ensure_tab(spreadsheet, tab_name, headers):
-    """
-    Get or create the worksheet. Always checks that row 1 contains
-    the correct headers -- writes them if missing or wrong.
-    """
     try:
         ws = spreadsheet.worksheet(tab_name)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=tab_name, rows=10000, cols=len(headers))
         log.info(f"  Created tab: {tab_name}")
 
-    # Check if header row is present and correct
     existing = ws.row_values(1)
     if existing != headers:
         if existing:
-            # Header row exists but is wrong/missing some columns -- overwrite row 1
             ws.delete_rows(1)
         ws.insert_row(headers, index=1, value_input_option="RAW")
         log.info(f"  Wrote headers to tab: {tab_name}")
@@ -171,7 +160,7 @@ def log_watchlist_to_sheet(watchlist: list, run_ts: str, today: str):
 
 
 # ===========================================================================
-# 1. UNIVERSE -- S&P 500 + Nasdaq 100
+# 1. UNIVERSE
 # ===========================================================================
 
 def _get_sp500() -> list:
@@ -179,274 +168,204 @@ def _get_sp500() -> list:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"}
         r = requests.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            headers=headers,
-            timeout=15,
+            headers=headers, timeout=15,
         )
         r.raise_for_status()
-        tables = pd.read_html(r.text)
-        tickers = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        log.info(f"  S&P 500: {len(tickers)} tickers from Wikipedia")
+        tickers = pd.read_html(r.text)[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        log.info(f"  S&P 500: {len(tickers)} tickers")
         return tickers
     except Exception as e:
-        log.warning(f"  Wikipedia S&P 500 failed: {e}")
-
-    try:
-        r = requests.get(
-            "https://pkgstore.datahub.io/core/s-and-p-500-companies/constituents_csv/data/constituents_csv.csv",
-            timeout=15,
-        )
-        r.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-        log.info(f"  S&P 500: {len(tickers)} tickers from datahub.io")
-        return tickers
-    except Exception as e:
-        log.warning(f"  datahub.io S&P 500 failed: {e}")
-
-    log.warning("  Using hardcoded S&P 500 fallback (503 tickers)")
-    return [
-        "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A",
-        "APD","ABNB","AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL",
-        "GOOG","MO","AMZN","AMCR","AEE","AAL","AEP","AXP","AIG","AMT",
-        "AWK","AMP","AME","AMGN","APH","ADI","ANSS","AON","APA","AAPL",
-        "AMAT","APTV","ACGL","ADM","ANET","AJG","AIZ","T","ATO","ADSK",
-        "AZO","AVB","AVY","AXON","BKR","BALL","BAC","BK","BBWI","BAX",
-        "BDX","BRK.B","BBY","BIO","TECH","BIIB","BLK","BX","BA","BCR",
-        "BMY","AVGO","BR","BRO","BF.B","BLDR","BG","CDNS","CZR","CPT",
-        "CPB","COF","CAH","KMX","CCL","CARR","CTLT","CAT","CBOE","CBRE",
-        "CDW","CE","COR","CNC","CNX","CDAY","CF","CRL","SCHW","CHTR",
-        "CVX","CMG","CB","CHD","CI","CINF","CTAS","CSCO","C","CFG",
-        "CLX","CME","CMS","KO","CTSH","CL","CMCSA","CAG","COP","ED",
-        "STZ","CEG","COO","CPRT","GLW","CTVA","CSGP","COST","CTRA","CRWD",
-        "CCI","CSX","CMI","CVS","DHI","DHR","DRI","DVA","DAY","DECK",
-        "DE","DAL","DVN","DXCM","FANG","DLR","DFS","DG","DLTR","D",
-        "DPZ","DOV","DOW","DHI","DTE","DUK","DD","EMN","ETN","EBAY",
-        "ECL","EIX","EW","EA","ELV","LLY","EMR","ENPH","ETR","EOG",
-        "EPAM","EQT","EFX","EQIX","EQR","ESS","EL","ETSY","EG","EVRG",
-        "ES","EXC","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST",
-        "FRT","FDX","FIS","FITB","FSLR","FE","FI","FLT","FMC","F",
-        "FTNT","FTV","FOXA","FOX","BEN","FCX","GRMN","IT","GE","GEHC",
-        "GEN","GNRC","GD","GIS","GM","GPC","GILD","GPN","GL","GS",
-        "HAL","HIG","HAS","HCA","DOC","HSIC","HSY","HES","HPE","HLT",
-        "HOLX","HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN",
-        "HII","IBM","IEX","IDXX","ITW","INCY","IR","PODD","INTC","ICE",
-        "IFF","IP","IPG","INTU","ISRG","IVZ","INVH","IQV","IRM","JBHT",
-        "JBL","JKHY","J","JNJ","JCI","JPM","JNPR","K","KVUE","KDP",
-        "KEY","KEYS","KMB","KIM","KMI","KLAC","KHC","KR","LHX","LH",
-        "LRCX","LW","LVS","LDOS","LEN","LNC","LIN","LYV","LKQ","LMT",
-        "L","LOW","LULU","LYB","MTB","MRO","MPC","MKTX","MAR","MMC",
-        "MLM","MAS","MA","MTCH","MKC","MCD","MCK","MDT","MRK","META",
-        "MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA","MHK","MOH",
-        "TAP","MDLZ","MPWR","MNST","MCO","MS","MOS","MSI","MSCI","NDAQ",
-        "NTAP","NFLX","NEM","NWSA","NWS","NEE","NKE","NI","NDSN","NSC",
-        "NTRS","NOC","NCLH","NRG","NUE","NVR","NVDA","NWA","ORLY","OXY",
-        "ODFL","OMC","ON","OKE","ORCL","OTIS","PCAR","PKG","PLTR","PH",
-        "PAYX","PAYC","PYPL","PNR","PEP","PFE","PCG","PM","PSX","PNW",
-        "PNC","POOL","PPG","PPL","PFG","PG","PGR","PRU","PEG","PTC",
-        "PSA","PHM","QRVO","PWR","QCOM","DGX","RL","RJF","RTX","O",
-        "REG","REGN","RF","RSG","RMD","RVTY","ROK","ROL","ROP","ROST",
-        "RCL","SPGI","CRM","SBAC","SLB","STX","SRE","NOW","SHW","SPG",
-        "SWKS","SJM","SW","SNA","SOLV","SO","LUV","SWK","SBUX","STT",
-        "STLD","STE","SYK","SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO",
-        "TPR","TRGP","TGT","TEL","TDY","TFX","TER","TSLA","TXN","TXT",
-        "TMO","TJX","TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN",
-        "USB","UBER","UDR","ULTA","UNP","UAL","UPS","URI","UNH","UHS",
-        "VLO","VTR","VLTO","VRSN","VRSK","VZ","VRTX","VTRS","VICI","V",
-        "VST","VMC","WRB","GWW","WAB","WBA","WMT","DIS","WBD","WM",
-        "WAT","WEC","WFC","WELL","WST","WDC","WHR","WRK","WY","WHR",
-        "WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZTS",
-    ]
+        log.warning(f"  S&P 500 scrape failed: {e}")
+    return []
 
 
 def _get_nasdaq100() -> list:
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner/1.0)"}
-        r = requests.get(
-            "https://en.wikipedia.org/wiki/Nasdaq-100",
-            headers=headers,
-            timeout=15,
-        )
+        r = requests.get("https://en.wikipedia.org/wiki/Nasdaq-100", headers=headers, timeout=15)
         r.raise_for_status()
-        tables = pd.read_html(r.text)
-        for table in tables:
+        for table in pd.read_html(r.text):
             for col in ("Ticker", "Symbol", "Ticker symbol"):
                 if col in table.columns:
-                    tickers = (table[col]
-                                .astype(str)
-                                .str.strip()
-                                .str.replace(r"\[.*?\]", "", regex=True)
-                                .tolist())
+                    tickers = (table[col].astype(str).str.strip()
+                               .str.replace(r"\[.*?\]", "", regex=True).tolist())
                     tickers = [t for t in tickers if t and t.lower() != "nan"]
                     if len(tickers) > 50:
-                        log.info(f"  Nasdaq-100: {len(tickers)} tickers from Wikipedia")
+                        log.info(f"  Nasdaq-100: {len(tickers)} tickers")
                         return tickers
     except Exception as e:
-        log.warning(f"  Wikipedia Nasdaq-100 failed: {e}")
+        log.warning(f"  Nasdaq-100 scrape failed: {e}")
+    return []
 
-    log.warning("  Using hardcoded Nasdaq-100 fallback")
-    return [
-        "MSFT","AAPL","NVDA","AMZN","META","TSLA","GOOGL","GOOG","AVGO","COST",
-        "NFLX","TMUS","ASML","CSCO","ADBE","AMD","PEP","INTU","AMAT","TXN",
-        "QCOM","ISRG","AMGN","BKNG","CMCSA","ARM","MU","PANW","ADI","LRCX",
-        "SBUX","INTC","KLAC","MELI","MDLZ","REGN","GILD","SNPS","CDNS","CEG",
-        "CRWD","CTAS","ABNB","MAR","ORLY","MRVL","MNST","PYPL","PCAR","FTNT",
-        "ADSK","DASH","WDAY","KDP","AZN","CHTR","ROP","NXPI","MCHP","PAYX",
-        "TEAM","AEP","ROST","DXCM","IDXX","CPRT","ODFL","EA","VRSK","FAST",
-        "FANG","XEL","CTSH","BIIB","ON","BKR","KHC","CSGP","DDOG","GEHC",
-        "EXC","TTD","CCEP","LULU","ANSS","ILMN","WBA","MDB","ZS","SIRI",
-        "MTCH","LCID","RIVN","DLTR","ZM","PDD","MRNA","GFS","ALGN","CDW",
-    ]
+
+def _get_russell1000() -> list:
+    """
+    Pull Russell 1000 tickers from iShares IWB ETF holdings CSV.
+    This gives ~1000 mid/large cap US stocks -- much wider than S&P+NDX alone.
+    """
+    try:
+        url = 
+"https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        # iShares CSV has a few header rows before the actual data
+        df = pd.read_csv(StringIO(r.text), skiprows=9)
+        tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
+        tickers = [t for t in tickers if t and t != "-" and t.lower() != "nan" and len(t) <= 5]
+        log.info(f"  Russell 1000: {len(tickers)} tickers from iShares")
+        return tickers
+    except Exception as e:
+        log.warning(f"  Russell 1000 fetch failed: {e}")
+    return []
+
+
+# Extended mid-cap supplement in case Russell fetch fails
+_MIDCAP_SUPPLEMENT = [
+    "PLTR","COIN","HOOD","SOFI","RIVN","LCID","NIO","XPEV","LI","DKNG",
+    "RBLX","U","SNAP","PINS","SPOT","ABNB","DASH","UBER","LYFT","AFRM",
+    "UPST","SQ","PYPL","SHOP","SE","MELI","GRAB","BIDU","JD","PDD",
+    "BABA","TCOM","NTES","TME","BILI","IQ","VIPS","ZTO","YMM","QFIN",
+    "CRWD","S","PANW","ZS","OKTA","TENB","CYBR","VRNS","QLYS","RDWR",
+    "NET","DDOG","MDB","SNOW","GTLB","HCP","CFLT","MNDY","BRZE","ZI",
+    "PATH","AI","C3AI","BBAI","SOUN","IREN","MARA","RIOT","CLSK","CORZ",
+    "WULF","BTBT","HUT","BITF","CIFR","APLD","TSLA","NVDA","AMD","INTC",
+    "QCOM","AVGO","MRVL","SWKS","QRVO","MPWR","MTSI","NXPI","ON","WOLF",
+    "SMCI","DELL","HPE","NTAP","PSTG","STX","WDC","LOGI","ZBRA","TER",
+    "AMAT","LRCX","KLAC","ASML","KLIC","UCTT","ONTO","ACLS","FORM","CAMT",
+    "SPY","QQQ","IWM","DIA","XLF","XLK","XLE","XLV","XLI","XLP",
+]
 
 
 def get_universe() -> list:
-    sp500    = _get_sp500()
-    nasdaq   = _get_nasdaq100()
-    combined = list(dict.fromkeys(sp500 + nasdaq))
-    log.info(f"  Combined universe: {len(combined)} unique tickers (S&P 500 + Nasdaq-100)")
+    sp500   = _get_sp500()
+    nasdaq  = _get_nasdaq100()
+    russell = _get_russell1000()
+    combined = list(dict.fromkeys(
+        sp500 + nasdaq + russell + _MIDCAP_SUPPLEMENT
+    ))
+    # Remove ETFs and non-standard tickers for gap scanning
+    combined = [t for t in combined if t and len(t) <= 5 and "." not in t]
+    log.info(f"  Total universe: {len(combined)} unique tickers")
     return combined
 
 
 # ===========================================================================
-# 2. PRE-MARKET / INTRADAY DATA via Alpaca
+# 2. GAP DETECTION via yfinance (fixes missing gaps vs Alpaca)
 # ===========================================================================
 
-def get_alpaca_client():
-    return tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
+def get_gap_data(tickers: list) -> list:
+    """
+    Download 2 days of 1-minute pre-market data via yfinance to compute:
+      - gap %  = (today open or latest price - yesterday close) / yesterday close
+      - premarket volume  = sum of volume in pre-market session today
+      - volume_ratio      = today premarket vol / 20-day avg daily vol
 
+    Falls back to daily bars if pre-market data unavailable.
+    """
+    log.info(f"  Fetching gap data for {len(tickers)} tickers via yfinance ...")
 
-def _get_current_price(snap) -> float:
-    try:
-        p = float(snap.latest_trade.p)
-        if p > 0:
-            return p
-    except Exception:
-        pass
-    try:
-        p = float(snap.minute_bar.c)
-        if p > 0:
-            return p
-    except Exception:
-        pass
-    try:
-        p = float(snap.daily_bar.o)
-        if p > 0:
-            return p
-    except Exception:
-        pass
-    return 0.0
-
-
-def _get_current_volume(snap) -> int:
-    try:
-        v = int(snap.daily_bar.v)
-        if v > 0:
-            return v
-    except Exception:
-        pass
-    try:
-        return int(snap.minute_bar.v)
-    except Exception:
-        return 0
-
-
-def _get_prev_close(snap) -> float:
-    try:
-        v = float(snap.previous_daily_bar.c)
-        if v > 0:
-            return v
-    except Exception:
-        pass
-    try:
-        v = float(snap.daily_bar.o)
-        if v > 0:
-            return v
-    except Exception:
-        pass
-    return 0.0
-
-
-def get_premarket_snapshots(tickers: list) -> dict:
-    api = get_alpaca_client()
-    log.info(f"  Fetching Alpaca snapshots for {len(tickers)} tickers ...")
-
-    snapshots  = {}
-    chunk_size = 100
+    # Step 1: get 22 days of daily closes to compute 20-day avg volume + prev close
+    # Download in bulk for speed
+    chunk_size = 200
+    daily_data = {}
 
     for i in range(0, len(tickers), chunk_size):
-        chunk = [t.replace("-", ".") for t in tickers[i:i + chunk_size]]
+        chunk = tickers[i:i + chunk_size]
         try:
-            snaps = api.get_snapshots(chunk)
-            for ticker, snap in snaps.items():
-                snapshots[ticker] = snap
+            raw = yf.download(
+                chunk,
+                period="25d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            if isinstance(raw.columns, pd.MultiIndex):
+                for t in chunk:
+                    try:
+                        df = raw.xs(t, axis=1, level=1).dropna()
+                        if not df.empty:
+                            daily_data[t] = df
+                    except Exception:
+                        pass
+            else:
+                # Single ticker returned
+                if len(chunk) == 1 and not raw.empty:
+                    daily_data[chunk[0]] = raw.dropna()
         except Exception as e:
-            log.warning(f"  Snapshot chunk {i//chunk_size + 1} error: {e}")
-        time.sleep(0.2)
+            log.warning(f"  Daily bulk download chunk {i//chunk_size+1} error: {e}")
+        time.sleep(0.3)
 
-    log.info(f"  Got snapshots for {len(snapshots)} tickers")
+    log.info(f"  Daily data fetched for {len(daily_data)} tickers")
 
-    if snapshots:
-        sample_ticker = next(iter(snapshots))
-        sample_snap   = snapshots[sample_ticker]
-        sample_price  = _get_current_price(sample_snap)
-        sample_prev   = _get_prev_close(sample_snap)
-        sample_vol    = _get_current_volume(sample_snap)
-        log.info(f"  Sample [{sample_ticker}]: price={sample_price:.2f}, prev_close={sample_prev:.2f}, volume={sample_vol:,}")
+    # Step 2: get today's pre-market price using 1d/1m with prepost=True
+    # Do this per-ticker only for those with meaningful daily data
+    gaps = []
+    no_premarket = 0
 
-    return snapshots
-
-
-def parse_gap_data(snapshots: dict) -> list:
-    gaps          = []
-    skipped_price = 0
-    skipped_gap   = 0
-    skipped_low   = 0
-
-    for ticker, snap in snapshots.items():
+    for ticker, df_daily in daily_data.items():
         try:
-            prev_close    = _get_prev_close(snap)
-            current_price = _get_current_price(snap)
-            current_vol   = _get_current_volume(snap)
-
-            try:
-                prev_vol = float(snap.previous_daily_bar.v)
-            except Exception:
-                prev_vol = 0
-
-            if prev_close <= 0 or current_price <= 0:
-                skipped_price += 1
+            if len(df_daily) < 2:
                 continue
 
-            if current_price < MIN_PRICE:
-                skipped_low += 1
+            prev_close  = float(df_daily["Close"].iloc[-2])
+            avg_vol_20d = float(df_daily["Volume"].iloc[-21:-1].mean()) if len(df_daily) >= 21 else float(df_daily["Volume"].mean())
+
+            if prev_close <= 0 or avg_vol_20d < MIN_AVG_VOL:
+                continue
+
+            # Try to get today's latest price (pre-market or intraday)
+            try:
+                tick   = yf.Ticker(ticker)
+                info   = tick.fast_info
+                current_price = float(info.last_price) if hasattr(info, "last_price") and info.last_price else 0.0
+                # If fast_info doesn't work, use today's daily bar open
+                if current_price <= 0:
+                    today_df = yf.download(ticker, period="1d", interval="1m",
+                                           prepost=True, progress=False)
+                    if not today_df.empty:
+                        current_price = float(today_df["Close"].iloc[-1])
+            except Exception:
+                current_price = 0.0
+
+            # Final fallback: use today's daily bar if available
+            if current_price <= 0:
+                current_price = float(df_daily["Close"].iloc[-1])
+
+            if current_price < MIN_PRICE or current_price <= 0:
                 continue
 
             gap_pct = ((current_price - prev_close) / prev_close) * 100
 
             if gap_pct < MIN_GAP_PCT or gap_pct > MAX_GAP_PCT:
-                skipped_gap += 1
                 continue
 
-            vol_ratio = current_vol / prev_vol if prev_vol > 0 else 0.0
+            # Get today's volume so far
+            try:
+                today_df_v = yf.download(ticker, period="1d", interval="1m",
+                                         prepost=True, progress=False)
+                premarket_vol = int(today_df_v["Volume"].sum()) if not today_df_v.empty else 0
+            except Exception:
+                premarket_vol = 0
+
+            volume_ratio = premarket_vol / avg_vol_20d if avg_vol_20d > 0 and premarket_vol > 0 else 0.0
 
             gaps.append({
                 "ticker"          : ticker,
-                "prior_close"     : prev_close,
-                "premarket_price" : current_price,
-                "premarket_volume": current_vol,
-                "daily_vol_avg"   : prev_vol,
-                "gap_pct"         : gap_pct,
-                "volume_ratio"    : vol_ratio,
+                "prior_close"     : round(prev_close, 2),
+                "premarket_price" : round(current_price, 2),
+                "premarket_volume": premarket_vol,
+                "avg_vol_20d"     : int(avg_vol_20d),
+                "gap_pct"         : round(gap_pct, 2),
+                "volume_ratio"    : round(volume_ratio, 2),
             })
 
         except Exception as ex:
-            log.debug(f"  parse error for {ticker}: {ex}")
+            log.debug(f"  Gap parse error {ticker}: {ex}")
             continue
 
-    log.info(f"  Snapshot parse: {len(gaps)} gaps found | "
-             f"skipped price={skipped_price}, low_price={skipped_low}, outside_gap_range={skipped_gap}")
-
     gaps.sort(key=lambda x: x["gap_pct"], reverse=True)
+    log.info(f"  Gaps found: {len(gaps)} tickers with gap between {MIN_GAP_PCT}% and {MAX_GAP_PCT}%")
     return gaps
 
 
@@ -454,34 +373,25 @@ def parse_gap_data(snapshots: dict) -> list:
 # 3. NEWS SENTIMENT via Finnhub
 # ===========================================================================
 
-# Expanded word lists for better headline coverage
 POSITIVE_WORDS = {
-    # earnings / guidance
     "beat", "beats", "topped", "exceeded", "exceeds", "surpassed", "record",
     "raised", "raises", "boosted", "boosts", "lifted", "lifts", "increased",
-    "increases", "above", "upbeat",
-    # price action / analyst
-    "upgrade", "upgraded", "outperform", "overweight", "buy", "bullish",
-    "breakout", "rallies", "rally", "surge", "surges", "soars", "soar",
-    "jumps", "jump", "spikes", "spike", "climbs", "climb", "rises", "rise",
-    # business
-    "profit", "profits", "growth", "gains", "gain", "win", "wins",
-    "deal", "merger", "acquisition", "partnership", "approval", "approved",
-    "launch", "launches", "expands", "expansion", "positive", "strong",
-    "stronger", "strength", "robust", "solid", "better",
+    "increases", "above", "upbeat", "upgrade", "upgraded", "outperform",
+    "overweight", "buy", "bullish", "breakout", "rallies", "rally", "surge",
+    "surges", "soars", "soar", "jumps", "jump", "spikes", "spike", "climbs",
+    "climb", "rises", "rise", "profit", "profits", "growth", "gains", "gain",
+    "win", "wins", "deal", "merger", "acquisition", "partnership", "approval",
+    "approved", "launch", "launches", "expands", "expansion", "positive",
+    "strong", "stronger", "strength", "robust", "solid", "better",
 }
 
 NEGATIVE_WORDS = {
-    # earnings / guidance
     "missed", "misses", "miss", "below", "disappointed", "disappoints",
     "disappointing", "cut", "cuts", "lowered", "lowers", "reduced", "reduces",
-    "slashed", "slashes", "warned", "warns", "warning",
-    # price action / analyst
-    "downgrade", "downgraded", "underperform", "underweight", "sell", "bearish",
-    "falls", "fall", "drops", "drop", "slides", "slide", "slumps", "slump",
-    "plunges", "plunge", "tumbles", "tumble", "declines", "decline", "sinks",
-    "sink", "dips", "dip",
-    # business / legal
+    "slashed", "slashes", "warned", "warns", "warning", "downgrade",
+    "downgraded", "underperform", "underweight", "sell", "bearish", "falls",
+    "fall", "drops", "drop", "slides", "slide", "slumps", "slump", "plunges",
+    "plunge", "tumbles", "tumble", "declines", "decline", "sinks", "sink",
     "loss", "losses", "weak", "weaker", "weakness", "concern", "concerns",
     "risk", "risks", "lawsuit", "sued", "investigation", "probe", "recall",
     "halt", "halted", "suspended", "layoffs", "restructuring", "bankruptcy",
@@ -490,16 +400,11 @@ NEGATIVE_WORDS = {
 
 
 def score_headline(text: str) -> float:
-    """
-    Returns sentiment score: +1.0 (very positive) to -1.0 (very negative).
-    Uses substring matching so partial word forms are caught.
-    """
     if not text:
         return 0.0
     text_lower = text.lower()
-    # Use substring matching rather than exact word set intersection
-    pos = sum(1 for w in POSITIVE_WORDS if w in text_lower)
-    neg = sum(1 for w in NEGATIVE_WORDS if w in text_lower)
+    pos   = sum(1 for w in POSITIVE_WORDS if w in text_lower)
+    neg   = sum(1 for w in NEGATIVE_WORDS if w in text_lower)
     total = pos + neg
     if total == 0:
         return 0.0
@@ -516,27 +421,29 @@ def fetch_news_sentiment(tickers: list) -> dict:
     today_str     = datetime.now().strftime("%Y-%m-%d")
     yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
     results       = {}
-    neutral_count = 0
 
     for ticker in tickers:
+        # Finnhub uses plain ticker symbols -- strip any dots/dashes
+        finnhub_ticker = ticker.replace("-", ".").replace(".", "-")
         try:
-            url    = "https://finnhub.io/api/v1/company-news"
-            params = {
-                "symbol": ticker,
-                "from"  : yesterday_str,
-                "to"    : today_str,
-                "token" : FINNHUB_API_KEY,
-            }
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(
+                "https://finnhub.io/api/v1/company-news",
+                params={
+                    "symbol": ticker,
+                    "from"  : yesterday_str,
+                    "to"    : today_str,
+                    "token" : FINNHUB_API_KEY,
+                },
+                timeout=10,
+            )
             r.raise_for_status()
             articles = r.json()
 
-            if not articles:
+            if not isinstance(articles, list) or not articles:
                 results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
-                neutral_count += 1
+                time.sleep(0.5)
                 continue
 
-            # Score up to 5 most recent articles, combine headline + summary
             recent = articles[:5]
             scores = [
                 score_headline(a.get("headline", "") + " " + a.get("summary", ""))
@@ -544,28 +451,19 @@ def fetch_news_sentiment(tickers: list) -> dict:
             ]
             avg_score    = round(sum(scores) / len(scores), 3)
             top_headline = recent[0].get("headline", "")
+            label        = "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral"
 
-            # Slightly tighter thresholds so more gets labelled
-            label = "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral"
-
-            results[ticker] = {
-                "score"   : avg_score,
-                "label"   : label,
-                "headline": top_headline,
-            }
-            if label == "neutral":
-                neutral_count += 1
-
-            time.sleep(1.1)  # Finnhub free tier: 60 calls/min
+            results[ticker] = {"score": avg_score, "label": label, "headline": top_headline}
+            time.sleep(1.1)  # stay under 60 calls/min free tier
 
         except Exception as e:
             log.warning(f"  News fetch failed for {ticker}: {e}")
             results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
-            neutral_count += 1
 
-    log.info(f"  Sentiment done: {len(results)} tickers, {neutral_count} neutral, "
-             f"{sum(1 for v in results.values() if v['label'] == 'positive')} positive, "
-             f"{sum(1 for v in results.values() if v['label'] == 'negative')} negative")
+    pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
+    neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
+    neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
+    log.info(f"  Sentiment: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
     return results
 
 
@@ -615,7 +513,7 @@ def get_supertrend_signals(tickers: list) -> dict:
             threads=True,
         )
     except Exception as e:
-        log.warning(f"  yfinance download failed: {e}")
+        log.warning(f"  yfinance Supertrend download failed: {e}")
         return {}
 
     signals = {}
@@ -637,11 +535,14 @@ def get_supertrend_signals(tickers: list) -> dict:
 
 def get_spy_change() -> float:
     try:
-        snap  = get_alpaca_client().get_snapshot("SPY")
-        prev  = _get_prev_close(snap)
-        curr  = _get_current_price(snap)
-        if prev > 0 and curr > 0:
-            return ((curr - prev) / prev) * 100
+        spy = yf.Ticker("SPY")
+        df  = yf.download("SPY", period="2d", interval="1d", auto_adjust=True, progress=False)
+        if len(df) >= 2:
+            prev  = float(df["Close"].iloc[-2])
+            # Get latest price from fast_info
+            curr = float(spy.fast_info.last_price)
+            if prev > 0 and curr > 0:
+                return ((curr - prev) / prev) * 100
     except Exception:
         pass
     return 0.0
@@ -653,8 +554,6 @@ def get_spy_change() -> float:
 
 def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
                  spy_change: float) -> dict:
-    ticker = gap_data["ticker"]
-
     gap_score    = min(100, max(0, (gap_data["gap_pct"] - MIN_GAP_PCT) / (10 - MIN_GAP_PCT) * 100))
     vol_score    = min(100, max(0, (gap_data["volume_ratio"] - 0.5) / 2.5 * 100))
     sent_raw     = sentiment.get("score", 0.0)
@@ -664,11 +563,11 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
     rs_score     = min(100, max(0, (rel_strength + 5) / 10 * 100))
 
     composite = round(
-        (gap_score   * W_GAP          / 100) +
-        (vol_score   * W_VOLUME       / 100) +
-        (sent_score  * W_SENTIMENT    / 100) +
-        (st_score    * W_SUPERTREND   / 100) +
-        (rs_score    * W_REL_STRENGTH / 100),
+        (gap_score * W_GAP          / 100) +
+        (vol_score * W_VOLUME       / 100) +
+        (sent_score * W_SENTIMENT   / 100) +
+        (st_score  * W_SUPERTREND   / 100) +
+        (rs_score  * W_REL_STRENGTH / 100),
         1
     )
 
@@ -677,7 +576,7 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
     target    = round(entry * 1.04, 2)
 
     return {
-        "ticker"             : ticker,
+        "ticker"             : gap_data["ticker"],
         "score"              : composite,
         "gap_pct"            : gap_data["gap_pct"],
         "premarket_volume"   : gap_data["premarket_volume"],
@@ -686,7 +585,7 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
         "sentiment_label"    : sentiment.get("label", "neutral"),
         "news_headline"      : sentiment.get("headline", ""),
         "supertrend_signal"  : "bullish" if supertrend == 1 else "bearish" if supertrend == -1 else "neutral",
-        "rel_strength_vs_spy": rel_strength,
+        "rel_strength_vs_spy": round(rel_strength, 3),
         "prior_close"        : gap_data["prior_close"],
         "premarket_price"    : entry,
         "stop_loss"          : stop_loss,
@@ -707,28 +606,34 @@ def run_morning_scanner():
     log.info(f"  Run: {run_ts}")
     log.info("=" * 60)
 
+    # Build universe
     tickers = get_universe()
 
-    log.info("\n[1/5] Fetching snapshots ...")
-    snapshots = get_premarket_snapshots(tickers)
-    gap_list  = parse_gap_data(snapshots)
+    # Find gaps
+    log.info("\n[1/5] Scanning for gaps ...")
+    gap_list = get_gap_data(tickers)
 
     if not gap_list:
-        log.warning("No tickers found with gap > %.1f%%. Check Alpaca credentials and data feed.", MIN_GAP_PCT)
+        log.warning("No tickers found gapping > %.1f%%. Market may be flat or data issue.", MIN_GAP_PCT)
         return
 
     gap_tickers = [g["ticker"] for g in gap_list]
+    log.info(f"  {len(gap_tickers)} tickers gapping up, proceeding ...")
 
+    # SPY baseline
     log.info("\n[2/5] Getting SPY baseline ...")
     spy_change = get_spy_change()
-    log.info(f"  SPY change vs prior close: {spy_change:+.2f}%")
+    log.info(f"  SPY vs prior close: {spy_change:+.2f}%")
 
+    # News sentiment
     log.info("\n[3/5] Fetching news sentiment ...")
     sentiment_map = fetch_news_sentiment(gap_tickers)
 
+    # Supertrend
     log.info("\n[4/5] Computing Supertrend signals ...")
     supertrend_map = get_supertrend_signals(gap_tickers)
 
+    # Score and rank
     log.info("\n[5/5] Scoring and ranking ...")
     watchlist = []
     for gap_data in gap_list:
@@ -750,7 +655,7 @@ def run_morning_scanner():
     for i, w in enumerate(watchlist, 1):
         print(f"  {i:<3} {w['ticker']:<7} {w['score']:<7} "
               f"{w['gap_pct']:>+5.1f}%  "
-              f"{w['volume_ratio']:>6.1f}x    "
+              f"{w['volume_ratio']:>6.2f}x    "
               f"{w['sentiment_label']:<11} "
               f"{w['supertrend_signal']:<10} "
               f"${w['premarket_price']:<7.2f} "
@@ -762,7 +667,7 @@ def run_morning_scanner():
     log_watchlist_to_sheet(watchlist, run_ts, today)
 
     log.info("=" * 60)
-    log.info(f"  Tickers scanned         : {len(snapshots)}")
+    log.info(f"  Universe scanned        : {len(tickers)}")
     log.info(f"  Gapping tickers found   : {len(gap_list)}")
     log.info(f"  Top setups logged       : {len(watchlist)}")
     log.info(f"  SPY vs prior close      : {spy_change:+.2f}%")
