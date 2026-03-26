@@ -204,8 +204,11 @@ def _get_russell1000() -> list:
     This gives ~1000 mid/large cap US stocks -- much wider than S&P+NDX alone.
     """
     try:
-        url = 
-"https://www.ishares.com/us/products/239707/ishares-russell-1000-etf/1467271812596.ajax?fileType=csv&fileName=IWB_holdings&dataType=fund"
+        url = (
+            "https://www.ishares.com/us/products/239707/"
+            "ishares-russell-1000-etf/1467271812596.ajax"
+            "?fileType=csv&fileName=IWB_holdings&dataType=fund"
+        )
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         # iShares CSV has a few header rows before the actual data
