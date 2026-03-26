@@ -301,10 +301,9 @@ def get_gap_data(tickers: list) -> list:
 
     log.info(f"  Daily data fetched for {len(daily_data)} tickers")
 
-    # Step 2: get today's pre-market price using 1d/1m with prepost=True
-    # Do this per-ticker only for those with meaningful daily data
+    # Step 2: for each ticker with daily data, fetch today's 1-min bars once
+    # (prepost=True captures pre-market session) and derive price + volume together.
     gaps = []
-    no_premarket = 0
 
     for ticker, df_daily in daily_data.items():
         try:
@@ -312,26 +311,36 @@ def get_gap_data(tickers: list) -> list:
                 continue
 
             prev_close  = float(df_daily["Close"].iloc[-2])
-            avg_vol_20d = float(df_daily["Volume"].iloc[-21:-1].mean()) if len(df_daily) >= 21 else float(df_daily["Volume"].mean())
+            avg_vol_20d = (float(df_daily["Volume"].iloc[-21:-1].mean())
+                           if len(df_daily) >= 21
+                           else float(df_daily["Volume"].mean()))
 
             if prev_close <= 0 or avg_vol_20d < MIN_AVG_VOL:
                 continue
 
-            # Try to get today's latest price (pre-market or intraday)
+            # Single download for both current price and today's volume
+            current_price  = 0.0
+            premarket_vol  = 0
             try:
-                tick   = yf.Ticker(ticker)
-                info   = tick.fast_info
-                current_price = float(info.last_price) if hasattr(info, "last_price") and info.last_price else 0.0
-                # If fast_info doesn't work, use today's daily bar open
-                if current_price <= 0:
-                    today_df = yf.download(ticker, period="1d", interval="1m",
-                                           prepost=True, progress=False)
-                    if not today_df.empty:
-                        current_price = float(today_df["Close"].iloc[-1])
+                today_1m = yf.download(
+                    ticker, period="1d", interval="1m",
+                    prepost=True, progress=False, auto_adjust=True
+                )
+                if not today_1m.empty:
+                    current_price = float(today_1m["Close"].iloc[-1])
+                    premarket_vol = int(today_1m["Volume"].sum())
             except Exception:
-                current_price = 0.0
+                pass
 
-            # Final fallback: use today's daily bar if available
+            # Fallback to fast_info if 1m download failed
+            if current_price <= 0:
+                try:
+                    fi = yf.Ticker(ticker).fast_info
+                    current_price = float(fi.last_price) if hasattr(fi, "last_price") and fi.last_price else 0.0
+                except Exception:
+                    pass
+
+            # Last resort: yesterday's close (no gap will be detected but avoids crash)
             if current_price <= 0:
                 current_price = float(df_daily["Close"].iloc[-1])
 
@@ -343,14 +352,8 @@ def get_gap_data(tickers: list) -> list:
             if gap_pct < MIN_GAP_PCT or gap_pct > MAX_GAP_PCT:
                 continue
 
-            # Get today's volume so far
-            try:
-                today_df_v = yf.download(ticker, period="1d", interval="1m",
-                                         prepost=True, progress=False)
-                premarket_vol = int(today_df_v["Volume"].sum()) if not today_df_v.empty else 0
-            except Exception:
-                premarket_vol = 0
-
+            # volume_ratio: today's accumulated volume vs 20-day avg DAILY volume
+            # Divide avg by 6.5 trading hours to get per-session scale, then compare
             volume_ratio = premarket_vol / avg_vol_20d if avg_vol_20d > 0 and premarket_vol > 0 else 0.0
 
             gaps.append({
@@ -360,7 +363,7 @@ def get_gap_data(tickers: list) -> list:
                 "premarket_volume": premarket_vol,
                 "avg_vol_20d"     : int(avg_vol_20d),
                 "gap_pct"         : round(gap_pct, 2),
-                "volume_ratio"    : round(volume_ratio, 2),
+                "volume_ratio"    : round(volume_ratio, 3),
             })
 
         except Exception as ex:
@@ -373,61 +376,37 @@ def get_gap_data(tickers: list) -> list:
 
 
 # ===========================================================================
-# 3. NEWS SENTIMENT via Finnhub
+# 3. NEWS SENTIMENT: Finnhub headlines + Claude API analysis
+# ===========================================================================
+# Flow:
+#   1. Fetch up to 5 recent headlines per ticker from Finnhub (free tier)
+#   2. Send ALL headlines for ALL tickers in ONE Claude API call (cheap + fast)
+#   3. Claude returns JSON with score (-1 to +1), label, and top headline
+#
+# Required env vars:
+#   FINNHUB_API_KEY   -- for fetching headlines
+#   ANTHROPIC_API_KEY -- for Claude sentiment analysis (set automatically in
+#                        GitHub Actions if you add it as a secret)
 # ===========================================================================
 
-POSITIVE_WORDS = {
-    "beat", "beats", "topped", "exceeded", "exceeds", "surpassed", "record",
-    "raised", "raises", "boosted", "boosts", "lifted", "lifts", "increased",
-    "increases", "above", "upbeat", "upgrade", "upgraded", "outperform",
-    "overweight", "buy", "bullish", "breakout", "rallies", "rally", "surge",
-    "surges", "soars", "soar", "jumps", "jump", "spikes", "spike", "climbs",
-    "climb", "rises", "rise", "profit", "profits", "growth", "gains", "gain",
-    "win", "wins", "deal", "merger", "acquisition", "partnership", "approval",
-    "approved", "launch", "launches", "expands", "expansion", "positive",
-    "strong", "stronger", "strength", "robust", "solid", "better",
-}
+import json as _json
 
-NEGATIVE_WORDS = {
-    "missed", "misses", "miss", "below", "disappointed", "disappoints",
-    "disappointing", "cut", "cuts", "lowered", "lowers", "reduced", "reduces",
-    "slashed", "slashes", "warned", "warns", "warning", "downgrade",
-    "downgraded", "underperform", "underweight", "sell", "bearish", "falls",
-    "fall", "drops", "drop", "slides", "slide", "slumps", "slump", "plunges",
-    "plunge", "tumbles", "tumble", "declines", "decline", "sinks", "sink",
-    "loss", "losses", "weak", "weaker", "weakness", "concern", "concerns",
-    "risk", "risks", "lawsuit", "sued", "investigation", "probe", "recall",
-    "halt", "halted", "suspended", "layoffs", "restructuring", "bankruptcy",
-    "default", "negative", "pressure",
-}
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 
-def score_headline(text: str) -> float:
-    if not text:
-        return 0.0
-    text_lower = text.lower()
-    pos   = sum(1 for w in POSITIVE_WORDS if w in text_lower)
-    neg   = sum(1 for w in NEGATIVE_WORDS if w in text_lower)
-    total = pos + neg
-    if total == 0:
-        return 0.0
-    return round((pos - neg) / total, 3)
-
-
-def fetch_news_sentiment(tickers: list) -> dict:
+def _fetch_headlines_finnhub(tickers: list) -> dict:
+    """
+    Fetches up to 5 headlines per ticker from Finnhub.
+    Returns {ticker: [headline_strings]} -- empty list if none found.
+    """
     if not FINNHUB_API_KEY:
-        log.warning("  FINNHUB_API_KEY not set -- skipping sentiment")
         return {}
-
-    log.info(f"  Fetching news sentiment for {len(tickers)} tickers via Finnhub ...")
 
     today_str     = datetime.now().strftime("%Y-%m-%d")
     yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
-    results       = {}
+    headlines_map = {}
 
     for ticker in tickers:
-        # Finnhub uses plain ticker symbols -- strip any dots/dashes
-        finnhub_ticker = ticker.replace("-", ".").replace(".", "-")
         try:
             r = requests.get(
                 "https://finnhub.io/api/v1/company-news",
@@ -441,32 +420,131 @@ def fetch_news_sentiment(tickers: list) -> dict:
             )
             r.raise_for_status()
             articles = r.json()
+            if isinstance(articles, list) and articles:
+                headlines_map[ticker] = [
+                    a.get("headline", "") for a in articles[:5] if a.get("headline")
+                ]
+            else:
+                headlines_map[ticker] = []
+            time.sleep(0.3)   # lighter sleep -- we don't need full analysis here
+        except Exception:
+            headlines_map[ticker] = []
 
-            if not isinstance(articles, list) or not articles:
-                results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
-                time.sleep(0.5)
-                continue
+    return headlines_map
 
-            recent = articles[:5]
-            scores = [
-                score_headline(a.get("headline", "") + " " + a.get("summary", ""))
-                for a in recent
-            ]
-            avg_score    = round(sum(scores) / len(scores), 3)
-            top_headline = recent[0].get("headline", "")
-            label        = "positive" if avg_score > 0.05 else "negative" if avg_score < -0.05 else "neutral"
 
-            results[ticker] = {"score": avg_score, "label": label, "headline": top_headline}
-            time.sleep(1.1)  # stay under 60 calls/min free tier
+def _analyze_sentiment_claude(headlines_map: dict) -> dict:
+    """
+    Sends all headlines to Claude in a single API call.
+    Returns {ticker: {score, label, headline}}.
+    """
+    if not ANTHROPIC_API_KEY:
+        log.warning("  ANTHROPIC_API_KEY not set -- skipping Claude sentiment")
+        return {}
 
-        except Exception as e:
-            log.warning(f"  News fetch failed for {ticker}: {e}")
-            results[ticker] = {"score": 0.0, "label": "neutral", "headline": ""}
+    # Build a compact input -- only include tickers that have headlines
+    tickers_with_news = {t: h for t, h in headlines_map.items() if h}
+    if not tickers_with_news:
+        log.info("  No headlines found for any ticker -- skipping Claude sentiment")
+        return {}
+
+    # Format headlines as a simple text block
+    lines = []
+    for ticker, headlines in tickers_with_news.items():
+        combined = " | ".join(headlines)
+        lines.append(f"{ticker}: {combined}")
+    headlines_text = "\n".join(lines)
+
+    prompt = f"""You are a financial news sentiment analyzer.
+
+For each stock ticker below, analyze the headlines and return a JSON object.
+Return ONLY valid JSON, no explanation, no markdown, no backticks.
+
+Format:
+{{
+  "TICKER": {{"score": 0.7, "label": "positive", "headline": "top headline here"}},
+  ...
+}}
+
+Rules:
+- score: float from -1.0 (very negative) to +1.0 (very positive), 0.0 = neutral
+- label: exactly one of "positive", "negative", "neutral"
+- positive if score > 0.1, negative if score < -0.1, else neutral
+- headline: the single most relevant headline for that ticker
+- If no meaningful signal, use score 0.0 and label "neutral"
+
+Headlines:
+{headlines_text}"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key"        : ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type"     : "application/json",
+            },
+            json={
+                "model"     : "claude-haiku-4-5-20251001",
+                "max_tokens": 2048,
+                "messages"  : [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        raw_text = r.json()["content"][0]["text"].strip()
+
+        # Strip markdown code fences if Claude added them
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
+            raw_text = re.sub(r"\n?```$", "", raw_text)
+
+        parsed = _json.loads(raw_text)
+        log.info(f"  Claude analyzed sentiment for {len(parsed)} tickers")
+        return parsed
+
+    except Exception as e:
+        log.warning(f"  Claude sentiment API call failed: {e}")
+        return {}
+
+
+def fetch_news_sentiment(tickers: list) -> dict:
+    """
+    Main entry point. Fetches headlines via Finnhub, analyzes via Claude.
+    Falls back to neutral for any ticker where data is unavailable.
+    """
+    log.info(f"  Fetching headlines for {len(tickers)} tickers via Finnhub ...")
+    headlines_map = _fetch_headlines_finnhub(tickers)
+
+    found = sum(1 for h in headlines_map.values() if h)
+    log.info(f"  Headlines found for {found}/{len(tickers)} tickers")
+
+    log.info("  Analyzing sentiment via Claude API (single batch call) ...")
+    claude_results = _analyze_sentiment_claude(headlines_map)
+
+    # Build final results dict, filling in neutral for any missing tickers
+    results = {}
+    for ticker in tickers:
+        if ticker in claude_results:
+            raw = claude_results[ticker]
+            results[ticker] = {
+                "score"   : float(raw.get("score", 0.0)),
+                "label"   : str(raw.get("label", "neutral")),
+                "headline": str(raw.get("headline", "")),
+            }
+        else:
+            # No news or Claude didn't return this ticker
+            headlines = headlines_map.get(ticker, [])
+            results[ticker] = {
+                "score"   : 0.0,
+                "label"   : "neutral",
+                "headline": headlines[0] if headlines else "",
+            }
 
     pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
     neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
     neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
-    log.info(f"  Sentiment: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
+    log.info(f"  Sentiment done: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
     return results
 
 
