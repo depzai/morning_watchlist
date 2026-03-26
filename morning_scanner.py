@@ -62,10 +62,9 @@ ATR_PERIOD = 10
 MULTIPLIER = 3.0
 
 # Scoring weights (must sum to 100)
-W_GAP          = 25
-W_VOLUME       = 25
-W_SENTIMENT    = 20
-W_SUPERTREND   = 20
+W_GAP          = 35
+W_SENTIMENT    = 30
+W_SUPERTREND   = 25
 W_REL_STRENGTH = 10
 
 # Google Sheets
@@ -75,7 +74,7 @@ ET            = ZoneInfo("America/New_York")
 
 WATCHLIST_HEADERS = [
     "run_timestamp", "date", "ticker", "score",
-    "gap_pct", "premarket_volume", "volume_ratio",
+    "gap_pct",
     "sentiment_score", "sentiment_label", "news_headline",
     "supertrend_signal", "rel_strength_vs_spy",
     "prior_close", "premarket_price",
@@ -141,8 +140,6 @@ def log_watchlist_to_sheet(watchlist: list, run_ts: str, today: str):
             w["ticker"],
             w["score"],
             round(w["gap_pct"], 2),
-            w["premarket_volume"],
-            round(w["volume_ratio"], 2),
             round(w["sentiment_score"], 3),
             w["sentiment_label"],
             w["news_headline"][:200] if w["news_headline"] else "",
@@ -376,106 +373,59 @@ def get_gap_data(tickers: list) -> list:
 
 
 # ===========================================================================
-# 3. NEWS SENTIMENT: Finnhub headlines + Claude API analysis
+# 3. NEWS SENTIMENT via Claude API with web search (single batch call)
 # ===========================================================================
-# Flow:
-#   1. Fetch up to 5 recent headlines per ticker from Finnhub (free tier)
-#   2. Send ALL headlines for ALL tickers in ONE Claude API call (cheap + fast)
-#   3. Claude returns JSON with score (-1 to +1), label, and top headline
+# One API call for ALL top tickers together -- Claude searches the web,
+# finds catalysts for each, and returns structured JSON in one shot.
+# Cost: ~1-3 web searches total vs 10 previously. ~$0.01-0.03 per run.
 #
-# Required env vars:
-#   FINNHUB_API_KEY   -- for fetching headlines
-#   ANTHROPIC_API_KEY -- for Claude sentiment analysis (set automatically in
-#                        GitHub Actions if you add it as a secret)
+# Required env var: ANTHROPIC_API_KEY
 # ===========================================================================
 
 import json as _json
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+SENTIMENT_TOP_N   = 10   # only research the top N tickers by pre-score
 
 
-def _fetch_headlines_finnhub(tickers: list) -> dict:
+def fetch_news_sentiment(tickers: list) -> dict:
     """
-    Fetches up to 5 headlines per ticker from Finnhub.
-    Returns {ticker: [headline_strings]} -- empty list if none found.
+    Single Claude API call with web_search for ALL tickers at once.
+    Claude searches for catalysts across all tickers and returns JSON.
     """
-    if not FINNHUB_API_KEY:
-        return {}
+    neutral = {"score": 0.0, "label": "neutral", "headline": ""}
 
-    today_str     = datetime.now().strftime("%Y-%m-%d")
-    yesterday_str = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
-    headlines_map = {}
-
-    for ticker in tickers:
-        try:
-            r = requests.get(
-                "https://finnhub.io/api/v1/company-news",
-                params={
-                    "symbol": ticker,
-                    "from"  : yesterday_str,
-                    "to"    : today_str,
-                    "token" : FINNHUB_API_KEY,
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            articles = r.json()
-            if isinstance(articles, list) and articles:
-                headlines_map[ticker] = [
-                    a.get("headline", "") for a in articles[:5] if a.get("headline")
-                ]
-            else:
-                headlines_map[ticker] = []
-            time.sleep(0.3)   # lighter sleep -- we don't need full analysis here
-        except Exception:
-            headlines_map[ticker] = []
-
-    return headlines_map
-
-
-def _analyze_sentiment_claude(headlines_map: dict) -> dict:
-    """
-    Sends all headlines to Claude in a single API call.
-    Returns {ticker: {score, label, headline}}.
-    """
     if not ANTHROPIC_API_KEY:
-        log.warning("  ANTHROPIC_API_KEY not set -- skipping Claude sentiment")
+        log.warning("  ANTHROPIC_API_KEY not set -- skipping sentiment")
+        return {t: neutral for t in tickers}
+
+    if not tickers:
         return {}
 
-    # Build a compact input -- only include tickers that have headlines
-    tickers_with_news = {t: h for t, h in headlines_map.items() if h}
-    if not tickers_with_news:
-        log.info("  No headlines found for any ticker -- skipping Claude sentiment")
-        return {}
+    today      = datetime.now().strftime("%B %d, %Y")
+    ticker_str = ", ".join(tickers)
 
-    # Format headlines as a simple text block
-    lines = []
-    for ticker, headlines in tickers_with_news.items():
-        combined = " | ".join(headlines)
-        lines.append(f"{ticker}: {combined}")
-    headlines_text = "\n".join(lines)
+    prompt = (
+        "Today is " + today + ". I need you to research the following stock tickers "
+        "that are all gapping up significantly today: " + ticker_str + ".\n\n"
+        "For each ticker, search the web to find the catalyst driving today's move -- "
+        "look for earnings beats/misses, analyst upgrades/downgrades, FDA decisions, "
+        "M&A news, guidance changes, or any major news from the last 24 hours.\n\n"
+        "Return ONLY a single JSON object -- no explanation, no markdown, no extra text.\n"
+        "Format:\n"
+        "{\n"
+        "  \"TICKER1\": {\"score\": 0.8, \"label\": \"positive\", \"headline\": \"brief catalyst summary\"},\n"
+        "  \"TICKER2\": {\"score\": -0.5, \"label\": \"negative\", \"headline\": \"brief catalyst summary\"}\n"
+        "}\n\n"
+        "Rules:\n"
+        "- score: -1.0 (very negative) to +1.0 (very positive)\n"
+        "- label: exactly one of positive / negative / neutral\n"
+        "- positive if score > 0.1, negative if score < -0.1, else neutral\n"
+        "- headline: one concise sentence describing the main catalyst\n"
+        "- Include ALL tickers listed, even if no news found (use score 0.0, neutral)"
+    )
 
-    prompt = f"""You are a financial news sentiment analyzer.
-
-For each stock ticker below, analyze the headlines and return a JSON object.
-Return ONLY valid JSON, no explanation, no markdown, no backticks.
-
-Format:
-{{
-  "TICKER": {{"score": 0.7, "label": "positive", "headline": "top headline here"}},
-  ...
-}}
-
-Rules:
-- score: float from -1.0 (very negative) to +1.0 (very positive), 0.0 = neutral
-- label: exactly one of "positive", "negative", "neutral"
-- positive if score > 0.1, negative if score < -0.1, else neutral
-- headline: the single most relevant headline for that ticker
-- If no meaningful signal, use score 0.0 and label "neutral"
-
-Headlines:
-{headlines_text}"""
-
+    log.info(f"  Claude batch web search for {len(tickers)} tickers: {ticker_str}")
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -487,65 +437,61 @@ Headlines:
             json={
                 "model"     : "claude-haiku-4-5-20251001",
                 "max_tokens": 2048,
+                "tools"     : [{"type": "web_search_20250305", "name": "web_search"}],
                 "messages"  : [{"role": "user", "content": prompt}],
             },
-            timeout=30,
+            timeout=90,
         )
         r.raise_for_status()
-        raw_text = r.json()["content"][0]["text"].strip()
+        data = r.json()
 
-        # Strip markdown code fences if Claude added them
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
-            raw_text = re.sub(r"\n?```$", "", raw_text)
+        # Extract the final text block (Claude writes JSON after tool use)
+        raw_text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                raw_text = block["text"].strip()
 
-        parsed = _json.loads(raw_text)
-        log.info(f"  Claude analyzed sentiment for {len(parsed)} tickers")
-        return parsed
+        if not raw_text:
+            log.warning("  Claude returned no text -- falling back to neutral")
+            return {t: neutral for t in tickers}
+
+        # Strip markdown fences if Claude added them
+        raw_text = re.sub("^```[a-z]*\n?", "", raw_text)
+        raw_text = re.sub("\n?```$", "", raw_text.strip())
+
+        # Find the outermost JSON object
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if not match:
+            log.warning(f"  No JSON in Claude response: {raw_text[:200]}")
+            return {t: neutral for t in tickers}
+
+        parsed = _json.loads(match.group())
+        log.info(f"  Claude returned sentiment for {len(parsed)} tickers")
+
+        results = {}
+        for ticker in tickers:
+            if ticker in parsed:
+                raw = parsed[ticker]
+                results[ticker] = {
+                    "score"   : float(raw.get("score", 0.0)),
+                    "label"   : str(raw.get("label", "neutral")),
+                    "headline": str(raw.get("headline", "")),
+                }
+                log.info(f"    {ticker}: {results[ticker]['label']} "
+                         f"({results[ticker]['score']:+.2f}) | "
+                         f"{results[ticker]['headline'][:80]}")
+            else:
+                results[ticker] = neutral
+
+        pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
+        neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
+        neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
+        log.info(f"  Sentiment: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
+        return results
 
     except Exception as e:
-        log.warning(f"  Claude sentiment API call failed: {e}")
-        return {}
-
-
-def fetch_news_sentiment(tickers: list) -> dict:
-    """
-    Main entry point. Fetches headlines via Finnhub, analyzes via Claude.
-    Falls back to neutral for any ticker where data is unavailable.
-    """
-    log.info(f"  Fetching headlines for {len(tickers)} tickers via Finnhub ...")
-    headlines_map = _fetch_headlines_finnhub(tickers)
-
-    found = sum(1 for h in headlines_map.values() if h)
-    log.info(f"  Headlines found for {found}/{len(tickers)} tickers")
-
-    log.info("  Analyzing sentiment via Claude API (single batch call) ...")
-    claude_results = _analyze_sentiment_claude(headlines_map)
-
-    # Build final results dict, filling in neutral for any missing tickers
-    results = {}
-    for ticker in tickers:
-        if ticker in claude_results:
-            raw = claude_results[ticker]
-            results[ticker] = {
-                "score"   : float(raw.get("score", 0.0)),
-                "label"   : str(raw.get("label", "neutral")),
-                "headline": str(raw.get("headline", "")),
-            }
-        else:
-            # No news or Claude didn't return this ticker
-            headlines = headlines_map.get(ticker, [])
-            results[ticker] = {
-                "score"   : 0.0,
-                "label"   : "neutral",
-                "headline": headlines[0] if headlines else "",
-            }
-
-    pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
-    neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
-    neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
-    log.info(f"  Sentiment done: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
-    return results
+        log.warning(f"  Claude batch sentiment failed: {e}")
+        return {t: neutral for t in tickers}
 
 
 # ===========================================================================
@@ -636,7 +582,6 @@ def get_spy_change() -> float:
 def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
                  spy_change: float) -> dict:
     gap_score    = min(100, max(0, (gap_data["gap_pct"] - MIN_GAP_PCT) / (10 - MIN_GAP_PCT) * 100))
-    vol_score    = min(100, max(0, (gap_data["volume_ratio"] - 0.5) / 2.5 * 100))
     sent_raw     = sentiment.get("score", 0.0)
     sent_score   = min(100, max(0, (sent_raw + 1) / 2 * 100))
     st_score     = 100 if supertrend == 1 else 0 if supertrend == -1 else 50
@@ -644,11 +589,10 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
     rs_score     = min(100, max(0, (rel_strength + 5) / 10 * 100))
 
     composite = round(
-        (gap_score * W_GAP          / 100) +
-        (vol_score * W_VOLUME       / 100) +
-        (sent_score * W_SENTIMENT   / 100) +
-        (st_score  * W_SUPERTREND   / 100) +
-        (rs_score  * W_REL_STRENGTH / 100),
+        (gap_score  * W_GAP          / 100) +
+        (sent_score * W_SENTIMENT    / 100) +
+        (st_score   * W_SUPERTREND   / 100) +
+        (rs_score   * W_REL_STRENGTH / 100),
         1
     )
 
@@ -660,8 +604,6 @@ def score_ticker(gap_data: dict, sentiment: dict, supertrend: int,
         "ticker"             : gap_data["ticker"],
         "score"              : composite,
         "gap_pct"            : gap_data["gap_pct"],
-        "premarket_volume"   : gap_data["premarket_volume"],
-        "volume_ratio"       : gap_data["volume_ratio"],
         "sentiment_score"    : sentiment.get("score", 0.0),
         "sentiment_label"    : sentiment.get("label", "neutral"),
         "news_headline"      : sentiment.get("headline", ""),
@@ -706,20 +648,32 @@ def run_morning_scanner():
     spy_change = get_spy_change()
     log.info(f"  SPY vs prior close: {spy_change:+.2f}%")
 
-    # News sentiment
-    log.info("\n[3/5] Fetching news sentiment ...")
-    sentiment_map = fetch_news_sentiment(gap_tickers)
-
-    # Supertrend
-    log.info("\n[4/5] Computing Supertrend signals ...")
+    # Supertrend for all gapping tickers
+    log.info("\n[3/5] Computing Supertrend signals ...")
     supertrend_map = get_supertrend_signals(gap_tickers)
 
-    # Score and rank
-    log.info("\n[5/5] Scoring and ranking ...")
+    # PASS 1: score everything without sentiment to find top prospects
+    log.info("\n[4/5] Pre-scoring to find top prospects ...")
+    neutral = {"score": 0.0, "label": "neutral", "headline": ""}
+    prescore_list = []
+    for gap_data in gap_list:
+        scored = score_ticker(gap_data, neutral, supertrend_map.get(gap_data["ticker"], 0), spy_change)
+        prescore_list.append(scored)
+    prescore_list.sort(key=lambda x: x["score"], reverse=True)
+
+    # Only research the top SENTIMENT_TOP_N by pre-score
+    top_prospects = [w["ticker"] for w in prescore_list[:SENTIMENT_TOP_N]]
+    log.info(f"  Top {len(top_prospects)} prospects for Claude research: {top_prospects}")
+
+    # PASS 2: Claude web search only on top prospects
+    log.info("\n[5/5] Claude web search sentiment on top prospects ...")
+    sentiment_map = fetch_news_sentiment(top_prospects)
+
+    # Final scoring with sentiment applied to top prospects
     watchlist = []
     for gap_data in gap_list:
         ticker    = gap_data["ticker"]
-        sentiment = sentiment_map.get(ticker, {"score": 0.0, "label": "neutral", "headline": ""})
+        sentiment = sentiment_map.get(ticker, neutral)
         st_signal = supertrend_map.get(ticker, 0)
         scored    = score_ticker(gap_data, sentiment, st_signal, spy_change)
         watchlist.append(scored)
@@ -736,7 +690,6 @@ def run_morning_scanner():
     for i, w in enumerate(watchlist, 1):
         print(f"  {i:<3} {w['ticker']:<7} {w['score']:<7} "
               f"{w['gap_pct']:>+5.1f}%  "
-              f"{w['volume_ratio']:>6.2f}x    "
               f"{w['sentiment_label']:<11} "
               f"{w['supertrend_signal']:<10} "
               f"${w['premarket_price']:<7.2f} "
