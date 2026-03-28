@@ -388,10 +388,35 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SENTIMENT_TOP_N   = 10   # only research the top N tickers by pre-score
 
 
+def _claude_api_call(messages: list, tools: list = None, max_tokens: int = 2048) -> dict:
+    """Single Anthropic API call. Returns the response dict."""
+    body = {
+        "model"     : "claude-haiku-4-5-20251001",
+        "max_tokens": max_tokens,
+        "messages"  : messages,
+    }
+    if tools:
+        body["tools"] = tools
+
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key"        : ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type"     : "application/json",
+        },
+        json=body,
+        timeout=90,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def fetch_news_sentiment(tickers: list) -> dict:
     """
-    Single Claude API call with web_search for ALL tickers at once.
-    Claude searches for catalysts across all tickers and returns JSON.
+    Uses Claude with web_search in a proper agentic loop.
+    Web search is a multi-turn tool: Claude searches, gets results,
+    then writes the final JSON. We handle all tool_use turns automatically.
     """
     neutral = {"score": 0.0, "label": "neutral", "headline": ""}
 
@@ -406,92 +431,114 @@ def fetch_news_sentiment(tickers: list) -> dict:
     ticker_str = ", ".join(tickers)
 
     prompt = (
-        "Today is " + today + ". I need you to research the following stock tickers "
-        "that are all gapping up significantly today: " + ticker_str + ".\n\n"
-        "For each ticker, search the web to find the catalyst driving today's move -- "
-        "look for earnings beats/misses, analyst upgrades/downgrades, FDA decisions, "
-        "M&A news, guidance changes, or any major news from the last 24 hours.\n\n"
-        "Return ONLY a single JSON object -- no explanation, no markdown, no extra text.\n"
-        "Format:\n"
-        "{\n"
-        "  \"TICKER1\": {\"score\": 0.8, \"label\": \"positive\", \"headline\": \"brief catalyst summary\"},\n"
-        "  \"TICKER2\": {\"score\": -0.5, \"label\": \"negative\", \"headline\": \"brief catalyst summary\"}\n"
-        "}\n\n"
-        "Rules:\n"
-        "- score: -1.0 (very negative) to +1.0 (very positive)\n"
-        "- label: exactly one of positive / negative / neutral\n"
-        "- positive if score > 0.1, negative if score < -0.1, else neutral\n"
-        "- headline: one concise sentence describing the main catalyst\n"
-        "- Include ALL tickers listed, even if no news found (use score 0.0, neutral)"
+        "Today is " + today + ". Research these stocks that are gapping up today: "
+        + ticker_str + ". "
+        "Search the web to find what is driving each move today -- earnings, "
+        "analyst actions, FDA news, M&A, guidance, or other catalysts. "
+        "After searching, return ONLY a JSON object (no markdown, no explanation): "
+        '{"TICKER": {"score": 0.8, "label": "positive", "headline": "catalyst summary"}} '
+        "Score -1.0 to +1.0. Label: positive/negative/neutral. "
+        "Include every ticker even if no news (score 0.0, neutral)."
     )
 
-    log.info(f"  Claude batch web search for {len(tickers)} tickers: {ticker_str}")
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key"        : ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type"     : "application/json",
-            },
-            json={
-                "model"     : "claude-haiku-4-5-20251001",
-                "max_tokens": 2048,
-                "tools"     : [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages"  : [{"role": "user", "content": prompt}],
-            },
-            timeout=90,
-        )
-        r.raise_for_status()
-        data = r.json()
+    tools = [{"type": "web_search_20250305", "name": "web_search"}]
+    messages = [{"role": "user", "content": prompt}]
 
-        # Extract the final text block (Claude writes JSON after tool use)
-        raw_text = ""
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                raw_text = block["text"].strip()
+    log.info(f"  Claude web search for {len(tickers)} tickers: {ticker_str}")
 
-        if not raw_text:
-            log.warning("  Claude returned no text -- falling back to neutral")
+    # Agentic loop -- keep going until stop_reason is "end_turn" (not "tool_use")
+    max_turns = 8
+    for turn in range(max_turns):
+        try:
+            data = _claude_api_call(messages, tools=tools)
+        except Exception as e:
+            log.warning(f"  Claude API call failed (turn {turn+1}): {e}")
             return {t: neutral for t in tickers}
 
-        # Strip markdown fences if Claude added them
-        raw_text = re.sub("^```[a-z]*\n?", "", raw_text)
-        raw_text = re.sub("\n?```$", "", raw_text.strip())
+        stop_reason = data.get("stop_reason", "")
+        content     = data.get("content", [])
 
-        # Find the outermost JSON object
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if not match:
-            log.warning(f"  No JSON in Claude response: {raw_text[:200]}")
-            return {t: neutral for t in tickers}
+        log.info(f"  Turn {turn+1}: stop_reason={stop_reason}, blocks={len(content)}")
 
-        parsed = _json.loads(match.group())
-        log.info(f"  Claude returned sentiment for {len(parsed)} tickers")
+        # Add assistant response to message history
+        messages.append({"role": "assistant", "content": content})
 
-        results = {}
-        for ticker in tickers:
-            if ticker in parsed:
-                raw = parsed[ticker]
-                results[ticker] = {
-                    "score"   : float(raw.get("score", 0.0)),
-                    "label"   : str(raw.get("label", "neutral")),
-                    "headline": str(raw.get("headline", "")),
-                }
-                log.info(f"    {ticker}: {results[ticker]['label']} "
-                         f"({results[ticker]['score']:+.2f}) | "
-                         f"{results[ticker]['headline'][:80]}")
-            else:
-                results[ticker] = neutral
+        if stop_reason == "end_turn":
+            # Claude is done -- extract final text
+            raw_text = ""
+            for block in content:
+                if block.get("type") == "text":
+                    raw_text = block["text"].strip()
+            break
 
-        pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
-        neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
-        neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
-        log.info(f"  Sentiment: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
-        return results
+        if stop_reason == "tool_use":
+            # Claude wants to search -- collect all tool_use blocks and return results
+            tool_results = []
+            for block in content:
+                if block.get("type") == "tool_use":
+                    tool_id   = block["id"]
+                    tool_name = block.get("name", "")
+                    # The web_search tool result is already embedded in the response
+                    # We just need to acknowledge it with a tool_result message
+                    tool_results.append({
+                        "type"       : "tool_result",
+                        "tool_use_id": tool_id,
+                        "content"    : "Search completed.",
+                    })
 
-    except Exception as e:
-        log.warning(f"  Claude batch sentiment failed: {e}")
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # Any other stop reason -- bail
+        log.warning(f"  Unexpected stop_reason: {stop_reason}")
+        break
+    else:
+        log.warning("  Claude agentic loop hit max turns")
         return {t: neutral for t in tickers}
+
+    # Parse the JSON from Claude's final response
+    if not raw_text:
+        log.warning("  Claude returned no text in final response")
+        return {t: neutral for t in tickers}
+
+    # Strip markdown fences
+    raw_text = re.sub("^```[a-z]*\n?", "", raw_text)
+    raw_text = re.sub("\n?```$", "", raw_text.strip())
+
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if not match:
+        log.warning(f"  No JSON found in Claude response: {raw_text[:300]}")
+        return {t: neutral for t in tickers}
+
+    try:
+        parsed = _json.loads(match.group())
+    except Exception as e:
+        log.warning(f"  JSON parse failed: {e} | text: {raw_text[:300]}")
+        return {t: neutral for t in tickers}
+
+    log.info(f"  Claude returned sentiment for {len(parsed)} tickers")
+
+    results = {}
+    for ticker in tickers:
+        if ticker in parsed:
+            raw = parsed[ticker]
+            results[ticker] = {
+                "score"   : float(raw.get("score", 0.0)),
+                "label"   : str(raw.get("label", "neutral")),
+                "headline": str(raw.get("headline", "")),
+            }
+            log.info(f"    {ticker}: {results[ticker]['label']} "
+                     f"({results[ticker]['score']:+.2f}) | "
+                     f"{results[ticker]['headline'][:80]}")
+        else:
+            results[ticker] = neutral
+
+    pos_ct  = sum(1 for v in results.values() if v["label"] == "positive")
+    neg_ct  = sum(1 for v in results.values() if v["label"] == "negative")
+    neut_ct = sum(1 for v in results.values() if v["label"] == "neutral")
+    log.info(f"  Sentiment: {pos_ct} positive, {neg_ct} negative, {neut_ct} neutral")
+    return results
 
 
 # ===========================================================================
