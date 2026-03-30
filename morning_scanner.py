@@ -749,10 +749,16 @@ def run_morning_scanner():
         watchlist.append(scored)
 
     watchlist.sort(key=lambda x: x["score"], reverse=True)
+
+    # Keep only positive sentiment -- log how many were filtered
+    all_count      = len(watchlist)
+    watchlist      = [w for w in watchlist if w["sentiment_label"] == "positive"]
+    filtered_count = all_count - len(watchlist)
+    log.info(f"  Sentiment filter: kept {len(watchlist)} positive, dropped {filtered_count} neutral/negative")
     watchlist = watchlist[:TOP_N]
 
     print(f"\n{'=' * 80}")
-    print(f"  TOP {len(watchlist)} SETUPS -- {today}")
+    print(f"  TOP {len(watchlist)} POSITIVE SENTIMENT SETUPS -- {today}")
     print(f"{'=' * 80}")
     print(f"  {'#':<3} {'TICKER':<7} {'SCORE':<7} {'GAP%':<7} {'VOL_RATIO':<11} "
           f"{'SENTIMENT':<11} {'TREND':<10} {'ENTRY':<8} {'STOP':<8} {'TARGET'}")
